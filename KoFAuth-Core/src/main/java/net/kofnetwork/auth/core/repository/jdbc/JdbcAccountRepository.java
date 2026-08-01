@@ -282,6 +282,17 @@ public final class JdbcAccountRepository implements AccountRepository {
     }
 
     @Override
+    public @NotNull CompletableFuture<List<Account>> findPageAfter(long afterId, int limit) {
+        // Условие по первичному ключу с сортировкой по нему же — обычный range scan,
+        // стоимость которого не зависит от того, насколько далеко ушёл курсор.
+        return sql.queryList(
+                "SELECT " + COLUMNS + " FROM users WHERE id > ? ORDER BY id LIMIT ?",
+                JdbcAccountRepository::map,
+                afterId,
+                Math.max(1, Math.min(limit, 1000)));
+    }
+
+    @Override
     public @NotNull CompletableFuture<Boolean> delete(long accountId) {
         return sql.update("DELETE FROM users WHERE id = ?", accountId)
                 .thenApply(affected -> affected > 0);

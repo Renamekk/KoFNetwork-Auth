@@ -3,6 +3,7 @@ package net.kofnetwork.auth.telegram;
 import net.kofnetwork.auth.api.config.ConfigFile;
 import net.kofnetwork.auth.api.dto.AuthContext;
 import net.kofnetwork.auth.api.model.Account;
+import net.kofnetwork.auth.api.model.TokenType;
 import net.kofnetwork.auth.core.KoFAuthCore;
 import org.telegram.telegrambots.longpolling.util.LongPollingSingleThreadUpdateConsumer;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
@@ -103,6 +104,7 @@ public final class KoFAuthTelegramBot implements LongPollingSingleThreadUpdateCo
                     /devices — устройства
                     /history — история входов
                     /security — состояние защиты
+                    /sendcode — код подтверждения входа
                     /unlink — отвязать аккаунт""");
 
             case "/link" -> link(chatId, telegramId, argument);
@@ -111,9 +113,11 @@ public final class KoFAuthTelegramBot implements LongPollingSingleThreadUpdateCo
             case "/devices" -> withAccount(chatId, telegramId, account -> devices(chatId, account));
             case "/history" -> withAccount(chatId, telegramId, account -> history(chatId, account));
             case "/security" -> withAccount(chatId, telegramId, account -> security(chatId, account));
+            case "/sendcode" -> withAccount(chatId, telegramId, account -> sendCode(chatId, account));
             case "/login" -> send(chatId,
-                    "Подтверждение входа приходит сюда автоматически, когда вы заходите в игру. "
-                            + "Отдельная команда не нужна.");
+                    "Подтверждение входа приходит сюда автоматически, когда вы заходите в игру.\n\n"
+                            + "Если сообщение с кнопками не пришло — возьмите код командой "
+                            + "/sendcode и введите его в игре.");
             default -> send(chatId, "Неизвестная команда. Наберите /start.");
         }
     }
@@ -216,6 +220,36 @@ public final class KoFAuthTelegramBot implements LongPollingSingleThreadUpdateCo
                             binding.map(b -> b.notificationsEnabled()).orElse(false)
                                     ? "включены" : "выключены"));
         });
+    }
+
+    /**
+     * Выдаёт код подтверждения входа для ручного ввода.
+     *
+     * <p>Запасной путь к тому же, что делает кнопка «Это я»: сообщение с кнопками
+     * может не дойти — бот заблокирован, уведомления выключены на телефоне, — и без
+     * этой команды игрок с включённым вторым фактором остался бы заперт снаружи.
+     *
+     * <p>Ранее выданные коды гасятся: несколько действующих одновременно расширяют
+     * окно, в котором принимается любой из них. Тот же довод, что и для кодов
+     * восстановления пароля.
+     */
+    private void sendCode(long chatId, Account account) {
+        core.tokens().revokeAllByType(account.id(), TokenType.LOGIN_APPROVAL)
+                .thenCompose(ignored -> core.tokens()
+                        .issue(account.id(), TokenType.LOGIN_APPROVAL, null, null))
+                .thenAccept(issued -> send(chatId, """
+                        🔑 Код подтверждения входа:
+
+                        <code>%s</code>
+
+                        Введите его в игре: <code>/login пароль %s</code>
+                        Код действует 2 минуты и срабатывает один раз."""
+                        .formatted(issued.value(), issued.value())))
+                .exceptionally(e -> {
+                    LOGGER.error("Не удалось выдать код подтверждения", e);
+                    send(chatId, "Не удалось выдать код. Попробуйте позже.");
+                    return null;
+                });
     }
 
     // ------------------------------------------------------------------ подтверждение входа

@@ -17,6 +17,7 @@ import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -45,7 +46,7 @@ public final class AuthAdminCommand implements SimpleCommand {
 
     private static final List<String> SUBCOMMANDS = List.of(
             "reload", "info", "player", "lock", "unlock", "resetpassword",
-            "forceverify", "sessions", "devices", "logs");
+            "forceverify", "sessions", "devices", "logs", "migrate", "export", "import");
 
     private final KoFAuthCore core;
     private final MessageService messages;
@@ -101,6 +102,9 @@ public final class AuthAdminCommand implements SimpleCommand {
             case "sessions" -> withAccount(source, args, this::showSessions);
             case "devices" -> withAccount(source, args, this::showDevices);
             case "logs" -> withAccount(source, args, this::showLogs);
+            case "migrate" -> migrate(source);
+            case "export" -> export(source, args);
+            case "import" -> importAccounts(source, args);
             default -> usage(source);
         }
     }
@@ -270,6 +274,85 @@ public final class AuthAdminCommand implements SimpleCommand {
         });
     }
 
+    /**
+     * Применяет ожидающие миграции схемы.
+     *
+     * <p>Нужна при {@code migrate-on-startup: false}: обновление схемы сети из
+     * нескольких прокси в момент старта — это гонка за то, кто первым перезапустится,
+     * а здесь момент выбирает администратор.
+     */
+    private void migrate(CommandSource source) {
+        source.sendMessage(prefixed("<yellow>Применение миграций..."));
+        CompletableFuture
+                .supplyAsync(() -> core.database().migrateNow())
+                .thenAccept(outcome -> {
+                    if (!outcome.success()) {
+                        source.sendMessage(prefixed("<red>Миграции не применены: "
+                                + escape(outcome.error())));
+                        return;
+                    }
+                    source.sendMessage(prefixed(outcome.applied() == 0
+                            ? "<green>Схема актуальна, применять нечего"
+                            : "<green>Применено миграций: " + outcome.applied()
+                                    + " <gray>(схема на версии " + outcome.version() + ")"));
+                });
+    }
+
+    /**
+     * Выгружает аккаунты в файл.
+     *
+     * <p><b>Событие критическое.</b> Файл содержит хэши паролей всей сети, то есть
+     * равнозначен дампу таблицы {@code users}. Если выгрузку сделал не тот, кто
+     * должен был, это обязано быть видно в журнале с первого взгляда, а не
+     * восстанавливаться по косвенным признакам.
+     */
+    private void export(CommandSource source, String[] args) {
+        if (args.length < 2) {
+            source.sendMessage(prefixed("<yellow>Использование: <white>/auth export <файл>"));
+            return;
+        }
+        Path target = Path.of(args[1]);
+        source.sendMessage(prefixed("<yellow>Выгрузка аккаунтов в " + escape(target.toString()) + "..."));
+
+        // Событие без целевого аккаунта: выгрузка касается всей таблицы, и
+        // привязывать её к чьей-то строке значило бы исказить журнал.
+        core.audit().log(null, SecurityEventType.DATA_EXPORTED, contextOf(source),
+                        "Выгрузка аккаунтов в " + target)
+                .thenCompose(ignored -> core.transfer().exportTo(target))
+                .thenAccept(result -> source.sendMessage(result.success()
+                        ? prefixed("<green>Выгружено аккаунтов: " + result.processed()
+                                + " <gray>(файл содержит хэши паролей — храните как дамп базы)")
+                        : prefixed("<red>Не удалось выгрузить: " + escape(result.error()))))
+                .exceptionally(e -> {
+                    logger.error("Выгрузка аккаунтов не удалась", e);
+                    source.sendMessage(prefixed("<red>Ошибка: " + escape(e.getMessage())));
+                    return null;
+                });
+    }
+
+    /** Загружает аккаунты из файла выгрузки; существующие ники пропускаются. */
+    private void importAccounts(CommandSource source, String[] args) {
+        if (args.length < 2) {
+            source.sendMessage(prefixed("<yellow>Использование: <white>/auth import <файл>"));
+            return;
+        }
+        Path from = Path.of(args[1]);
+        source.sendMessage(prefixed("<yellow>Загрузка аккаунтов из " + escape(from.toString()) + "..."));
+
+        core.audit().log(null, SecurityEventType.DATA_IMPORTED, contextOf(source),
+                        "Загрузка аккаунтов из " + from)
+                .thenCompose(ignored -> core.transfer().importFrom(from))
+                .thenAccept(result -> source.sendMessage(result.success()
+                        ? prefixed("<green>Загружено: " + result.processed()
+                                + "<gray>, пропущено (уже существуют или битые): " + result.skipped())
+                        : prefixed("<red>Не удалось загрузить: " + escape(result.error()))))
+                .exceptionally(e -> {
+                    logger.error("Загрузка аккаунтов не удалась", e);
+                    source.sendMessage(prefixed("<red>Ошибка: " + escape(e.getMessage())));
+                    return null;
+                });
+    }
+
     // ------------------------------------------------------------------ вспомогательное
 
     /** Находит аккаунт по нику из аргументов и передаёт действию. */
@@ -332,7 +415,10 @@ public final class AuthAdminCommand implements SimpleCommand {
                   <gray>lock|unlock <ник> <white>— блокировка аккаунта
                   <gray>resetpassword <ник> <пароль> <white>— сброс пароля
                   <gray>forceverify <ник> <white>— подтвердить почту
-                  <gray>sessions|devices|logs <ник> <white>— сессии, устройства, журнал"""));
+                  <gray>sessions|devices|logs <ник> <white>— сессии, устройства, журнал
+                  <gray>migrate <white>— применить миграции схемы
+                  <gray>export <файл> <white>— выгрузить аккаунты (содержит хэши паролей)
+                  <gray>import <файл> <white>— загрузить аккаунты из выгрузки"""));
     }
 
     private Component prefixed(String text) {

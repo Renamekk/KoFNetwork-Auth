@@ -5,6 +5,7 @@ import net.kofnetwork.auth.api.model.DiscordBinding;
 import net.kofnetwork.auth.api.model.TelegramBinding;
 import net.kofnetwork.auth.api.result.OperationResult;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import java.time.Duration;
 import java.util.Optional;
@@ -58,16 +59,24 @@ public interface LinkService {
                                                                                     @NotNull AuthContext context);
 
     /**
-     * Завершает привязку Discord через OAuth2 с сайта.
+     * Завершает привязку Discord, личность в котором уже подтверждена OAuth2.
      *
-     * @param state параметр CSRF-защиты, выданный при начале авторизации; проверяется
-     *              на совпадение, иначе злоумышленник может привязать свой Discord
-     *              к чужому аккаунту, подсунув владельцу ссылку возврата
+     * <p><b>Обмен кода на токен сюда не входит.</b> Он требует HTTP-клиента и знания
+     * эндпоинтов Discord, а Core не должен зависеть ни от того, ни от другого: его
+     * вызывают и прокси, и боты, которым исходящий HTTP не нужен вовсе. Обмен и
+     * проверку параметра {@code state} выполняет веб-модуль, а сюда приходит уже
+     * установленный идентификатор.
+     *
+     * <p>Отсюда и разница с {@link #completeDiscordLink}: там доверие даёт одноразовый
+     * код, выданный в игре, здесь — подпись Discord под ответом на обмен кода.
+     *
+     * @param discordId идентификатор, полученный от {@code /users/@me}
+     * @param username  ник для отображения; {@code null}, если не запрошен
      */
-    @NotNull CompletableFuture<OperationResult<DiscordBinding>> completeDiscordOauth(long accountId,
-                                                                                     @NotNull String authorizationCode,
-                                                                                     @NotNull String state,
-                                                                                     @NotNull AuthContext context);
+    @NotNull CompletableFuture<OperationResult<DiscordBinding>> linkVerifiedDiscord(long accountId,
+                                                                                    long discordId,
+                                                                                    @Nullable String username,
+                                                                                    @NotNull AuthContext context);
 
     @NotNull CompletableFuture<OperationResult<Void>> unlinkTelegram(long accountId, @NotNull AuthContext context);
 

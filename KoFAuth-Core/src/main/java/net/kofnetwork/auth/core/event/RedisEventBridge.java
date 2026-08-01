@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import net.kofnetwork.auth.api.event.AuthEvent;
 import net.kofnetwork.auth.api.event.EventBus;
 import net.kofnetwork.auth.api.event.events.AccountLoginEvent;
+import net.kofnetwork.auth.api.event.events.LoginApprovalRequestedEvent;
 import net.kofnetwork.auth.api.event.events.BindingChangedEvent;
 import net.kofnetwork.auth.api.event.events.PasswordChangedEvent;
 import net.kofnetwork.auth.api.event.events.RemoteEvent;
@@ -237,6 +238,21 @@ public final class RedisEventBridge implements EventBus, AutoCloseable {
             }
             if (e.twoFactorUsed() != null) {
                 attributes.put("twoFactor", e.twoFactorUsed().name());
+            }
+            return attributes;
+        }
+        if (event instanceof LoginApprovalRequestedEvent e) {
+            // Токена подтверждения в событии нет по построению: бот выпускает свой,
+            // получив это сообщение. Здесь уезжает только то, что попадёт в текст
+            // запроса владельцу, — и адрес, как везде, в маскированном виде.
+            attributes.put("username", e.username());
+            attributes.put("method", e.method().name());
+            attributes.put("ip", e.context().ip().asMasked());
+            if (e.context().country() != null) {
+                attributes.put("country", e.context().country());
+            }
+            if (e.context().city() != null) {
+                attributes.put("city", e.context().city());
             }
             return attributes;
         }

@@ -73,6 +73,15 @@ public final class TokenServiceImpl implements TokenService {
                     config.getInt(ConfigFile.TELEGRAM, "link.code-length", 8));
             case EMAIL_VERIFY, PASSWORD_RESET -> TokenGenerator.numericCode(
                     config.getInt(ConfigFile.MAIL, "verification.code-length", 6));
+            // Код подтверждения входа человек либо нажимает кнопкой, либо вводит
+            // руками после /sendcode — отсюда читаемый алфавит вместо 64 знаков hex.
+            //
+            // Длина ограничена и сверху: код едет в callback_data кнопки Telegram,
+            // а туда помещается 64 байта вместе с префиксом. Значение по умолчанию
+            // даёт 50 бит, чего достаточно при сроке жизни в две минуты и при том,
+            // что это второй фактор — пароль к этому моменту уже проверен.
+            case LOGIN_APPROVAL -> TokenGenerator.humanReadableCode(
+                    config.getInt(ConfigFile.SECURITY, "two-factor.approval-code-length", 10));
             default -> TokenGenerator.randomToken();
         };
 

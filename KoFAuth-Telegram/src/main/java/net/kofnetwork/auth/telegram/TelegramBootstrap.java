@@ -2,8 +2,11 @@ package net.kofnetwork.auth.telegram;
 
 import net.kofnetwork.auth.api.config.ConfigFile;
 import net.kofnetwork.auth.api.event.events.AccountLoginEvent;
+import net.kofnetwork.auth.api.event.events.LoginApprovalRequestedEvent;
 import net.kofnetwork.auth.api.event.events.RemoteEvent;
 import net.kofnetwork.auth.api.event.events.SuspiciousActivityEvent;
+import net.kofnetwork.auth.api.model.TokenType;
+import net.kofnetwork.auth.api.model.TwoFactorMethod;
 import net.kofnetwork.auth.core.KoFAuthCore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -80,9 +83,50 @@ public final class TelegramBootstrap {
                 notifyLogin(core, bot, event);
                 return;
             }
+            if (event.isType(LoginApprovalRequestedEvent.class)) {
+                requestApproval(core, bot, event);
+                return;
+            }
             if (event.isType(SuspiciousActivityEvent.class)) {
                 notifySuspicious(core, bot, event);
             }
+        });
+    }
+
+    /**
+     * Показывает владельцу кнопки подтверждения входа.
+     *
+     * <p>Событие приходит без токена — его выпускает этот процесс. Так предъявительский
+     * код не попадает в общий канал Pub/Sub, и действующим остаётся ровно один.
+     *
+     * <p>Запрос от чужого метода игнорируется: при двух настроенных ботах сообщение
+     * должно уйти в тот канал, который выбран вторым фактором, а не в оба сразу.
+     */
+    private static void requestApproval(KoFAuthCore core, KoFAuthTelegramBot bot,
+                                        RemoteEvent event) {
+        if (!TwoFactorMethod.TELEGRAM.name().equals(event.attribute("method", ""))) {
+            return;
+        }
+        long accountId = event.accountId();
+
+        core.links().findTelegram(accountId).thenAccept(binding -> {
+            if (binding.isEmpty() || !binding.get().loginApprovalEnabled()) {
+                // Привязка снята или подтверждение выключено уже после того, как
+                // сервис выбрал этот метод. Токен не выпускаем: некому предъявлять.
+                LOGGER.warn("Запрос подтверждения для аккаунта {} без активной привязки", accountId);
+                return;
+            }
+            core.tokens().issue(accountId, TokenType.LOGIN_APPROVAL, null, null)
+                    .thenAccept(issued -> bot.requestApproval(
+                            binding.get().chatId(),
+                            issued.value(),
+                            event.attribute("username", "?"),
+                            event.attribute("ip", "?"),
+                            event.attribute("country", "неизвестно")))
+                    .exceptionally(e -> {
+                        LOGGER.error("Не удалось выпустить токен подтверждения", e);
+                        return null;
+                    });
         });
     }
 

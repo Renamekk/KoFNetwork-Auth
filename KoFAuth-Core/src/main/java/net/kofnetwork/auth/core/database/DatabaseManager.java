@@ -132,19 +132,50 @@ public final class DatabaseManager implements Reloadable, AutoCloseable {
         }
     }
 
+    /**
+     * Применяет ожидающие миграции на живом пуле.
+     *
+     * <p>Нужна для {@code /auth migrate}: при {@code migrate-on-startup: false}
+     * схему обновляют вручную в согласованный момент, а не в момент, когда узел
+     * случайно перезапустился первым.
+     *
+     * <p>Flyway берёт блокировку на таблице истории, поэтому одновременный запуск
+     * с нескольких узлов безопасен: второй дождётся первого и увидит, что применять
+     * уже нечего.
+     *
+     * @return число применённых миграций и итоговая версия схемы
+     */
+    public @NotNull MigrationOutcome migrateNow() {
+        DataSource source = dataSource();
+        try {
+            MigrateResult result = runFlyway(source);
+            return new MigrationOutcome(true, result.migrationsExecuted,
+                    result.targetSchemaVersion == null
+                            ? result.initialSchemaVersion : result.targetSchemaVersion,
+                    null);
+        } catch (RuntimeException e) {
+            // Наружу отдаём значением, а не исключением: администратор в чате
+            // должен увидеть причину, а не «внутренняя ошибка».
+            LOGGER.error("Ручной запуск миграций не удался", e);
+            return new MigrationOutcome(false, 0, null, e.getMessage());
+        }
+    }
+
+    /**
+     * Итог применения миграций.
+     *
+     * @param version итоговая версия схемы; {@code null}, если применять было нечего
+     *                и Flyway не сообщил исходную
+     */
+    public record MigrationOutcome(boolean success,
+                                   int applied,
+                                   @org.jetbrains.annotations.Nullable String version,
+                                   @org.jetbrains.annotations.Nullable String error) {
+    }
+
     private void migrate(DataSource source) {
         try {
-            MigrateResult result = Flyway.configure(getClass().getClassLoader())
-                    .dataSource(source)
-                    .locations("classpath:db/migration")
-                    // Схема уже могла существовать до подключения Flyway.
-                    .baselineOnMigrate(true)
-                    .baselineVersion("0")
-                    // Правка применённой миграции — ошибка разработчика, а не повод
-                    // молча продолжить: расхождение контрольной суммы должно быть заметным.
-                    .validateOnMigrate(true)
-                    .load()
-                    .migrate();
+            MigrateResult result = runFlyway(source);
 
             if (result.migrationsExecuted > 0) {
                 LOGGER.info("Применено миграций: {} (схема на версии {})",
@@ -157,6 +188,21 @@ public final class DatabaseManager implements Reloadable, AutoCloseable {
                     "Не удалось применить миграции схемы. Если база правилась вручную, "
                             + "сверьте таблицу flyway_schema_history.", e);
         }
+    }
+
+    /** Настройка Flyway в одном месте: автозапуск и ручной вызов обязаны совпадать. */
+    private MigrateResult runFlyway(DataSource source) {
+        return Flyway.configure(getClass().getClassLoader())
+                .dataSource(source)
+                .locations("classpath:db/migration")
+                // Схема уже могла существовать до подключения Flyway.
+                .baselineOnMigrate(true)
+                .baselineVersion("0")
+                // Правка применённой миграции — ошибка разработчика, а не повод
+                // молча продолжить: расхождение контрольной суммы должно быть заметным.
+                .validateOnMigrate(true)
+                .load()
+                .migrate();
     }
 
     /**

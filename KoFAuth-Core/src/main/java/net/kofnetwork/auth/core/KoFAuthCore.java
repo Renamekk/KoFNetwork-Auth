@@ -56,6 +56,7 @@ import net.kofnetwork.auth.core.service.impl.SecurityServiceImpl;
 import net.kofnetwork.auth.core.service.impl.SessionServiceImpl;
 import net.kofnetwork.auth.core.service.impl.TokenServiceImpl;
 import net.kofnetwork.auth.core.service.impl.TotpServiceImpl;
+import net.kofnetwork.auth.core.transfer.AccountTransfer;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -101,6 +102,7 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
     private final TokenService tokens;
     private final AuditServiceImpl audit;
     private final AdminOperations adminOperations;
+    private final AccountTransfer transfer;
     private final EmailNotificationListener emailNotifications;
 
     private volatile boolean ready;
@@ -182,6 +184,7 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
                 sessions, security, totp, tokens, email, audit, hasher, policy, config, eventBus);
 
         this.adminOperations = new AdminOperations(accountRepo, deviceRepo, roleRepo, settingsRepo);
+        this.transfer = new AccountTransfer(accountRepo, executors.io());
 
         // Уведомления подключаются подписчиком, а не вызовами из сервисов:
         // сервис публикует «игрок вошёл» и на этом заканчивает.
@@ -381,6 +384,17 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
      */
     public @NotNull AdminOperations adminOperations() {
         return adminOperations;
+    }
+
+    /**
+     * Перенос аккаунтов между установками — {@code /auth export} и {@code /auth import}.
+     *
+     * <p>Отдельно от {@link AdminOperations}: работа с файловой системой к операциям
+     * над аккаунтами не относится, и смешивать их значит давать обычным админским
+     * действиям повод зависеть от путей и прав на диске.
+     */
+    public @NotNull AccountTransfer transfer() {
+        return transfer;
     }
 
     // ------------------------------------------------------------------ жизненный цикл

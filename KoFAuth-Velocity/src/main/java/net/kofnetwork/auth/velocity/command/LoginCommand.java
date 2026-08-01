@@ -48,9 +48,12 @@ public final class LoginCommand implements SimpleCommand {
         }
 
         String[] args = invocation.arguments();
-        if (args.length != 1) {
+        // Второй аргумент — код второго фактора: TOTP либо код из бота, взятый
+        // командой /sendcode. Он необязателен: при двухшаговом входе игрок сначала
+        // получает запрос подтверждения и вводит код отдельно.
+        if (args.length < 1 || args.length > 2) {
             player.sendMessage(messages.prefixed("login-usage",
-                    "<yellow>Использование: <white>/login <пароль>"));
+                    "<yellow>Использование: <white>/login <пароль> [код]"));
             return;
         }
 
@@ -65,11 +68,11 @@ public final class LoginCommand implements SimpleCommand {
                         "<yellow>Зарегистрируйтесь: <white>/register <пароль> <пароль>"));
                 return;
             }
-            performLogin(player, args[0]);
+            performLogin(player, args[0], args.length > 1 ? args[1] : null);
         });
     }
 
-    private void performLogin(Player player, String password) {
+    private void performLogin(Player player, String password, String twoFactorCode) {
         AuthContext context = AuthContext.minecraft(
                 IpAddress.of(player.getRemoteAddress().getAddress()),
                 player.getCurrentServer()
@@ -79,7 +82,8 @@ public final class LoginCommand implements SimpleCommand {
                 player.getClientBrand());
 
         LoginRequest request = LoginRequest.ofPlayer(player.getUniqueId(),
-                player.getUsername(), password, context);
+                player.getUsername(), password, context)
+                .withTwoFactorCode(twoFactorCode);
 
         core.authentication().login(request)
                 .thenAccept(result -> handleResult(player, result))

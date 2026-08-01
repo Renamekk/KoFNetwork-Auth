@@ -116,6 +116,33 @@ public final class ApiDtos {
         }
     }
 
+    /**
+     * Выданная задача CAPTCHA.
+     *
+     * <p>Правильного ответа тут нет и быть не может: он остаётся в памяти сервиса,
+     * а в базе хранится только его SHA-256.
+     *
+     * @param options     варианты для {@code BUTTON_CLICK}; для остальных типов пусто
+     * @param imageBase64 PNG для текстовых типов; для кнопок {@code null}
+     */
+    @Schema(description = "Выданная задача CAPTCHA")
+    public record CaptchaChallengeResponse(
+            String challengeId,
+            @Schema(example = "BUTTON_CLICK") String type,
+            String prompt,
+            java.util.List<String> options,
+            @Schema(description = "PNG в base64") String imageBase64,
+            int remainingAttempts,
+            @Schema(description = "Срок задачи в ISO-8601") String expiresAt) {
+    }
+
+    @Schema(description = "Результат проверки CAPTCHA")
+    public record CaptchaVerdictResponse(
+            boolean passed,
+            @Schema(description = "Попытки исчерпаны — нужна новая задача") boolean exhausted,
+            int remainingAttempts) {
+    }
+
     @Schema(description = "Требуется второй фактор")
     public record TwoFactorRequiredResponse(
             String status,

@@ -56,7 +56,13 @@ async function api(path, options = {}, retry = true) {
     const body = text ? JSON.parse(text) : null;
 
     if (!response.ok) {
-        throw new Error((body && body.message) || 'Ошибка запроса');
+        const error = new Error((body && body.message) || 'Ошибка запроса');
+        // Код нужен вызывающему там, где на разные отказы реакция разная:
+        // например, исчерпанная CAPTCHA (410) требует новой задачи, а неверный
+        // ответ (400) — просто повторной попытки.
+        error.status = response.status;
+        error.body = body;
+        throw error;
     }
     return body;
 }
@@ -129,13 +135,109 @@ $('form-login').addEventListener('submit', async (event) => {
     }
 });
 
+// ------------------------------------------------------------------ CAPTCHA
+
+// Текущая задача. null — сервер CAPTCHA не требует либо она уже пройдена.
+let captcha = null;
+
+/**
+ * Запрашивает задачу и раскладывает её по форме.
+ *
+ * <p>Ответ сервер не присылает: для кнопок мы отправляем номер нажатой,
+ * для картинки — введённый код, и правильность знает только сервер.
+ */
+async function loadCaptcha() {
+    const block = $('captcha-block');
+    try {
+        captcha = await post('/captcha');
+    } catch {
+        // CAPTCHA выключена или недоступна — регистрация не должна из-за этого
+        // становиться невозможной. Сервер всё равно проверит своё условие.
+        captcha = null;
+        block.classList.add('hidden');
+        return;
+    }
+
+    $('captcha-prompt').textContent = captcha.prompt;
+    block.classList.remove('hidden');
+
+    const image = $('captcha-image');
+    const field = $('captcha-field');
+    const options = $('captcha-options');
+
+    options.replaceChildren();
+    $('captcha-answer').value = '';
+
+    if (captcha.imageBase64) {
+        image.src = 'data:image/png;base64,' + captcha.imageBase64;
+        image.classList.remove('hidden');
+        field.classList.remove('hidden');
+    } else {
+        image.classList.add('hidden');
+        field.classList.add('hidden');
+    }
+
+    // Номер варианта — это и есть ответ, поэтому кнопки нумеруются с единицы
+    // в том порядке, в котором их прислал сервер.
+    (captcha.options || []).forEach((label, index) => {
+        const button = el('button', 'captcha-option', label);
+        button.type = 'button';
+        button.dataset.answer = String(index + 1);
+        button.addEventListener('click', () => selectCaptcha(button.dataset.answer));
+        options.append(button);
+    });
+}
+
+/** Отмечает выбранный вариант; проверка произойдёт при отправке формы. */
+function selectCaptcha(answer) {
+    $('captcha-options').querySelectorAll('.captcha-option')
+        .forEach((b) => b.classList.toggle('chosen', b.dataset.answer === answer));
+    $('captcha-answer').value = answer;
+}
+
+/**
+ * Проверяет ответ.
+ *
+ * @returns {Promise<boolean>} пройдена ли задача
+ */
+async function verifyCaptcha() {
+    if (!captcha) {
+        return true;
+    }
+    const answer = $('captcha-answer').value.trim();
+    if (!answer) {
+        toast('Решите задачу', 'err');
+        return false;
+    }
+    try {
+        await post('/captcha/verify', { challengeId: captcha.challengeId, answer });
+        captcha = null;
+        $('captcha-block').classList.add('hidden');
+        return true;
+    } catch (e) {
+        // 410 означает исчерпанные попытки: старая задача больше не примет ответ,
+        // и продолжать её показывать было бы тупиком.
+        toast(e.status === 410 ? 'Попытки исчерпаны, вот новая задача' : 'Неверный ответ', 'err');
+        await loadCaptcha();
+        return false;
+    }
+}
+
+$('captcha-reload').addEventListener('click', (e) => { e.preventDefault(); loadCaptcha(); });
+
 $('form-register').addEventListener('submit', async (event) => {
     event.preventDefault();
+    // Порядок существенен: пароль уходит на сервер только после решённой задачи.
+    if (!await verifyCaptcha()) {
+        return;
+    }
     try {
         store.save(await post('/auth/register', formData(event.target)));
         await openAccount();
     } catch (e) {
         toast(e.message, 'err');
+        // Задача одноразовая: после любой неудачи регистрации нужна новая.
+        await loadCaptcha();
     }
 });
 
@@ -159,7 +261,11 @@ $('form-reset').addEventListener('submit', async (event) => {
     }
 });
 
-$('to-register').addEventListener('click', (e) => { e.preventDefault(); show('view-register'); });
+$('to-register').addEventListener('click', (e) => {
+    e.preventDefault();
+    show('view-register');
+    loadCaptcha();
+});
 $('to-login').addEventListener('click', (e) => { e.preventDefault(); showLogin(); });
 $('to-login-2').addEventListener('click', (e) => { e.preventDefault(); showLogin(); });
 $('to-forgot').addEventListener('click', (e) => { e.preventDefault(); show('view-forgot'); });
@@ -438,9 +544,53 @@ function renderLinks(profile) {
             } catch (e) { toast(e.message, 'err'); }
         });
         row.append(button);
+
+        // Discord умеет ещё и OAuth2: тогда код переписывать не нужно. Кнопка
+        // появляется, только если поток настроен на сервере, — иначе она вела бы
+        // в ошибку, и пользователю пришлось бы догадываться, что делать дальше.
+        if (key === 'discord' && !linked) {
+            const oauth = el('button', 'ghost', 'Через Discord');
+            oauth.addEventListener('click', async () => {
+                try {
+                    const result = await post('/discord/oauth/start');
+                    // Уход со страницы, а не новое окно: возврат от Discord —
+                    // это обычный редирект, и он должен попасть в ту же вкладку.
+                    window.location.href = result.url;
+                } catch (e) { toast(e.message, 'err'); }
+            });
+            row.append(oauth);
+        }
         block.append(row);
     });
 }
+
+/**
+ * Показывает итог возврата из Discord.
+ *
+ * <p>Параметр убирается из адреса сразу: иначе обновление страницы повторит
+ * сообщение о привязке, которой уже не происходит.
+ */
+function reportDiscordOutcome() {
+    const outcome = new URLSearchParams(window.location.search).get('discord');
+    if (!outcome) {
+        return;
+    }
+    window.history.replaceState({}, '', window.location.pathname);
+
+    const messages = {
+        linked: ['Discord привязан', 'ok'],
+        denied: ['Привязка отменена', ''],
+        expired: ['Ссылка устарела, начните заново', 'err'],
+        bad_request: ['Discord вернул неполный ответ', 'err'],
+        exchange_failed: ['Не удалось связаться с Discord', 'err'],
+        discord_already_linked: ['Этот Discord уже привязан к другому аккаунту', 'err'],
+        already_linked: ['К аккаунту уже привязан Discord', 'err']
+    };
+    const [message, kind] = messages[outcome] || ['Не удалось привязать Discord', 'err'];
+    toast(message, kind);
+}
+
+reportDiscordOutcome();
 
 $('form-password').addEventListener('submit', async (event) => {
     event.preventDefault();

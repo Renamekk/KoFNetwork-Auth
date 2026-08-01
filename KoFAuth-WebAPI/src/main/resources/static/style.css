@@ -170,6 +170,50 @@ dd { margin: 0; }
 .codes span { padding: 7px 9px; background: var(--bg); border-radius: 6px; text-align: center; }
 .qr { display: block; width: 190px; height: 190px; margin: 12px 0; border-radius: 8px; }
 
+/* CAPTCHA */
+.captcha {
+    margin: 4px 0 12px;
+    padding: 12px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+}
+
+.captcha-prompt { margin: 0 0 10px; font-size: 14px; }
+
+.captcha-image {
+    display: block;
+    max-width: 100%;
+    margin-bottom: 10px;
+    border-radius: 6px;
+}
+
+/* auto-fit вместо фиксированного числа колонок: количество вариантов
+   задаётся конфигурацией сервера, и вёрстка не должна о нём знать. */
+.captcha-options {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(88px, 1fr));
+    gap: 8px;
+}
+
+.captcha-option {
+    padding: 10px 6px;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+.captcha-option:hover { border-color: var(--accent); }
+
+.captcha-option.chosen {
+    color: #fff;
+    background: var(--accent);
+    border-color: var(--accent);
+}
+
 /* Уведомления */
 .toast {
     position: fixed;

@@ -115,6 +115,19 @@ public interface AccountRepository {
     /** Поиск по префиксу ника для автодополнения админских команд. */
     @NotNull CompletableFuture<List<Account>> searchByUsernamePrefix(@NotNull String prefix, int limit);
 
+    /**
+     * Страница аккаунтов в порядке возрастания идентификатора — для выгрузки.
+     *
+     * <p>Курсор по {@code id}, а не {@code LIMIT ... OFFSET}: смещение заставляет
+     * MySQL прочитать и отбросить все пропускаемые строки, и выгрузка стотысячной
+     * таблицы вырождается в квадратичную. Кроме того, вставка во время выгрузки
+     * сдвигает окно, и часть записей при OFFSET была бы пропущена.
+     *
+     * @param afterId    брать строки строго больше этого идентификатора; 0 — с начала
+     * @param limit      размер страницы
+     */
+    @NotNull CompletableFuture<List<Account>> findPageAfter(long afterId, int limit);
+
     /** Полное удаление аккаунта. Связанные записи уходят каскадом. */
     @NotNull CompletableFuture<Boolean> delete(long accountId);
 

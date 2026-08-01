@@ -7,8 +7,11 @@ import net.dv8tion.jda.api.requests.GatewayIntent;
 import net.dv8tion.jda.api.utils.cache.CacheFlag;
 import net.kofnetwork.auth.api.config.ConfigFile;
 import net.kofnetwork.auth.api.event.events.AccountLoginEvent;
+import net.kofnetwork.auth.api.event.events.LoginApprovalRequestedEvent;
 import net.kofnetwork.auth.api.event.events.RemoteEvent;
 import net.kofnetwork.auth.api.event.events.SuspiciousActivityEvent;
+import net.kofnetwork.auth.api.model.TokenType;
+import net.kofnetwork.auth.api.model.TwoFactorMethod;
 import net.kofnetwork.auth.core.KoFAuthCore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -105,6 +108,10 @@ public final class DiscordBootstrap {
                         event.attribute("country", "неизвестно")));
                 return;
             }
+            if (event.isType(LoginApprovalRequestedEvent.class)) {
+                requestApproval(core, jda, event);
+                return;
+            }
             if (event.isType(SuspiciousActivityEvent.class)) {
                 deliver(core, jda, event.accountId(), KoFAuthDiscordBot.approvalEmbedLike(
                         "Событие безопасности",
@@ -112,6 +119,52 @@ public final class DiscordBootstrap {
                         event.attribute("ip", "?"),
                         event.attribute("detail", "")));
             }
+        });
+    }
+
+    /**
+     * Присылает владельцу кнопки подтверждения входа.
+     *
+     * <p>Событие приходит без токена: {@code LOGIN_APPROVAL} — предъявительский код,
+     * и класть его в общий канал Pub/Sub нельзя. Токен выпускает этот процесс, у него
+     * есть доступ к базе, и действующим остаётся ровно один код на вход.
+     *
+     * <p>Чужой метод пропускаем: при настроенных обоих ботах запрос должен уйти
+     * в выбранный канал, а не продублироваться в оба.
+     */
+    private static void requestApproval(KoFAuthCore core, JDA jda, RemoteEvent event) {
+        if (!TwoFactorMethod.DISCORD.name().equals(event.attribute("method", ""))) {
+            return;
+        }
+        long accountId = event.accountId();
+
+        core.links().findDiscord(accountId).thenAccept(binding -> {
+            if (binding.isEmpty() || !binding.get().loginApprovalEnabled()) {
+                LOGGER.warn("Запрос подтверждения для аккаунта {} без активной привязки", accountId);
+                return;
+            }
+            core.tokens().issue(accountId, TokenType.LOGIN_APPROVAL, null, null)
+                    .thenAccept(issued -> jda.retrieveUserById(binding.get().discordId()).queue(
+                            user -> user.openPrivateChannel().queue(
+                                    channel -> channel
+                                            .sendMessageEmbeds(KoFAuthDiscordBot.approvalEmbed(
+                                                    event.attribute("username", "?"),
+                                                    event.attribute("ip", "?"),
+                                                    event.attribute("country", "неизвестно")))
+                                            .setActionRow(KoFAuthDiscordBot
+                                                    .approvalButtons(issued.value()))
+                                            .queue(success -> { },
+                                                    failure -> LOGGER.debug(
+                                                            "Личные сообщения закрыты: {}",
+                                                            failure.getMessage())),
+                                    failure -> LOGGER.debug("Не удалось открыть личный чат: {}",
+                                            failure.getMessage())),
+                            failure -> LOGGER.debug("Пользователь Discord не найден: {}",
+                                    failure.getMessage())))
+                    .exceptionally(e -> {
+                        LOGGER.error("Не удалось выпустить токен подтверждения", e);
+                        return null;
+                    });
         });
     }
 

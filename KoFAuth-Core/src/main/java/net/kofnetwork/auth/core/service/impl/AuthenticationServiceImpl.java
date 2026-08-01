@@ -8,6 +8,7 @@ import net.kofnetwork.auth.api.dto.PasswordChangeRequest;
 import net.kofnetwork.auth.api.event.EventBus;
 import net.kofnetwork.auth.api.event.events.AccountLoginEvent;
 import net.kofnetwork.auth.api.event.events.AccountLoginFailedEvent;
+import net.kofnetwork.auth.api.event.events.LoginApprovalRequestedEvent;
 import net.kofnetwork.auth.api.event.events.PasswordChangedEvent;
 import net.kofnetwork.auth.api.event.events.SuspiciousActivityEvent;
 import net.kofnetwork.auth.api.model.Account;
@@ -281,16 +282,41 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
                 });
             }
 
+            // Код из бота, введённый вместе с паролем: игрок взял его командой
+            // /sendcode, потому что сообщение с кнопками не дошло. Гасим тем же
+            // consume, что и кнопка, — код одноразовый независимо от способа ввода.
+            if (request.twoFactorCode() != null) {
+                return tokens.consume(request.twoFactorCode().trim(),
+                                TokenType.LOGIN_APPROVAL, request.context().ip())
+                        .thenCompose(consumed -> {
+                            // Код должен принадлежать тому же аккаунту: иначе действующий
+                            // код одного игрока пускал бы в чужой аккаунт под его паролем.
+                            boolean valid = consumed.isSuccess()
+                                    && Long.valueOf(account.id()).equals(consumed.value().accountId());
+                            if (!valid) {
+                                return recordFailure(account.id(), request,
+                                                LoginResultType.TWO_FACTOR_FAILED)
+                                        .thenApply(ignored -> AuthResult.rejected(
+                                                LoginResultType.TWO_FACTOR_FAILED, null));
+                            }
+                            return completeLogin(account, request, device, required, newDevice);
+                        });
+            }
+
             if (required == TwoFactorMethod.TOTP) {
                 return CompletableFuture.completedFuture(
                         AuthResult.twoFactorRequired(account, required, null));
             }
 
-            // Telegram и Discord: выпускаем токен подтверждения, по которому бот
-            // найдёт ожидающий запрос, когда игрок нажмёт кнопку.
-            return tokens.issue(account.id(), TokenType.LOGIN_APPROVAL, request.context().ip(), null)
-                    .thenApply(issued -> AuthResult.twoFactorRequired(
-                            account, required, issued.value()));
+            // Telegram и Discord: просим бота показать владельцу кнопки.
+            //
+            // Токен подтверждения выпускает сам бот, получив это событие. Выпустить
+            // его здесь и переслать значило бы положить предъявительский код в общий
+            // канал Pub/Sub, а держать два действующих кода на один вход — расширить
+            // окно, в котором любой из них принимается.
+            return events.publish(LoginApprovalRequestedEvent.of(
+                            account.id(), account.username(), required, request.context()))
+                    .thenApply(ignored -> AuthResult.twoFactorRequired(account, required, null));
         });
     }
 

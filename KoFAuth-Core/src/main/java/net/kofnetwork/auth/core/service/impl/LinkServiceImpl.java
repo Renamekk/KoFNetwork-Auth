@@ -17,6 +17,7 @@ import net.kofnetwork.auth.api.service.AuditService;
 import net.kofnetwork.auth.api.service.LinkService;
 import net.kofnetwork.auth.api.service.TokenService;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -146,14 +147,42 @@ public final class LinkServiceImpl implements LinkService {
     }
 
     @Override
-    public @NotNull CompletableFuture<OperationResult<DiscordBinding>> completeDiscordOauth(
-            long accountId, @NotNull String authorizationCode, @NotNull String state,
+    public @NotNull CompletableFuture<OperationResult<DiscordBinding>> linkVerifiedDiscord(
+            long accountId, long discordId, @Nullable String username,
             @NotNull AuthContext context) {
-        // Обмен кода на токен выполняется модулем KoFAuth-Discord: Core не должен
-        // зависеть от HTTP-клиента и знать эндпоинты Discord. Сюда попадает уже
-        // подтверждённая привязка.
-        return completed(OperationResult.fail("OAUTH_NOT_AVAILABLE",
-                "OAuth2 обрабатывается модулем KoFAuth-Discord"));
+
+        // Порядок проверок тот же, что при привязке по коду: сначала «этот Discord
+        // уже занят», потом «у аккаунта уже есть привязка». Две проверки, а не одна:
+        // уникальность в базе на discord_id ловит первый случай, но не второй, и без
+        // явной проверки владелец молча переписал бы себе чужую строку.
+        return discord.findByDiscordId(discordId).thenCompose(existing -> {
+            if (existing.isPresent()) {
+                return completed(OperationResult.fail(
+                        existing.get().accountId() == accountId
+                                ? "ALREADY_LINKED" : "DISCORD_ALREADY_LINKED",
+                        existing.get().accountId() == accountId
+                                ? "Этот Discord уже привязан к вашему аккаунту"
+                                : "Этот Discord уже привязан к другому аккаунту"));
+            }
+            return discord.findByAccount(accountId).thenCompose(own -> {
+                if (own.isPresent()) {
+                    return completed(OperationResult.<DiscordBinding>fail("ALREADY_LINKED",
+                            "К аккаунту уже привязан другой Discord"));
+                }
+                DiscordBinding fresh = DiscordBinding.create(accountId, discordId)
+                        .withProfile(username, null, null, null);
+
+                return discord.insert(fresh)
+                        .thenCompose(binding -> events.publish(BindingChangedEvent.of(accountId,
+                                        BindingChangedEvent.BindingKind.DISCORD,
+                                        BindingChangedEvent.Action.LINKED,
+                                        binding.displayName(), context))
+                                .thenCompose(ignored -> audit.log(accountId,
+                                        SecurityEventType.DISCORD_LINKED, context,
+                                        "Привязан Discord через OAuth2"))
+                                .thenApply(ignored -> OperationResult.ok(binding)));
+            });
+        });
     }
 
     @Override

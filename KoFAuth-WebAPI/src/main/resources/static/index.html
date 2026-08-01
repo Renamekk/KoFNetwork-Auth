@@ -49,6 +49,16 @@
                 <input name="passwordConfirmation" type="password" required
                        autocomplete="new-password">
             </label>
+            <div id="captcha-block" class="captcha hidden">
+                <p id="captcha-prompt" class="captcha-prompt"></p>
+                <img id="captcha-image" class="captcha-image hidden" alt="Код на картинке">
+                <div id="captcha-options" class="captcha-options"></div>
+                <label id="captcha-field" class="hidden">Код с картинки
+                    <input id="captcha-answer" maxlength="16" autocomplete="off"
+                           autocapitalize="characters" spellcheck="false">
+                </label>
+                <p class="links"><a href="#" id="captcha-reload">Другая задача</a></p>
+            </div>
             <button type="submit">Создать</button>
         </form>
         <p class="links"><a href="#" id="to-login">Уже есть аккаунт</a></p>
