@@ -1,0 +1,65 @@
+# =============================================================================
+#  KoFAuth — почта
+#
+#  Пароль SMTP задавайте переменной KOFAUTH_MAIL_SMTP_PASSWORD.
+# =============================================================================
+
+enabled: false
+
+smtp:
+  host: smtp.example.com
+  # 587 — STARTTLS (рекомендуется), 465 — SMTPS, 25 — без шифрования (не использовать).
+  port: 587
+  username: ""
+  password: ""
+
+  # STARTTLS: соединение начинается открытым и повышается до TLS.
+  starttls: true
+  # SMTPS: TLS с первого байта. Взаимоисключающе со starttls.
+  ssl: false
+
+  # Таймауты. Без них зависший почтовый сервер держит поток из пула kofauth-mail
+  # до бесконечности, и отправка писем встаёт целиком.
+  connection-timeout: 10s
+  read-timeout: 10s
+
+from:
+  address: "noreply@kofnetwork.net"
+  name: "KoF Network"
+
+# Адрес, на который приходят ответы игроков. Оставьте пустым, чтобы не принимать ответы.
+reply-to: ""
+
+verification:
+  # Срок жизни кода подтверждения почты.
+  code-ttl: 24h
+  # Срок жизни кода восстановления пароля. Короткий намеренно: это окно,
+  # в течение которого доступ к почтовому ящику даёт доступ к аккаунту.
+  reset-ttl: 30m
+  # Длина числового кода.
+  code-length: 6
+
+notifications:
+  # Слать письмо при входе с нового устройства.
+  new-device: true
+  # Слать письмо при входе из новой страны.
+  new-country: true
+  # Слать письмо при смене пароля.
+  password-changed: true
+  # Слать письмо при изменении привязок.
+  binding-changed: true
+
+# Домены одноразовой почты. Привязка с них запрещена: восстановить аккаунт
+# через ящик, который живёт десять минут, всё равно не выйдет.
+blocked-domains:
+  - mailinator.com
+  - guerrillamail.com
+  - 10minutemail.com
+  - tempmail.com
+  - throwawaymail.com
+  - yopmail.com
+
+templates:
+  # Каталог с шаблонами писем относительно папки конфигурации.
+  # Подстановки вида {{username}}, {{code}}, {{ip}}, {{country}}, {{expires}}.
+  directory: "mail-templates"

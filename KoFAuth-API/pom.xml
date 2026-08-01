@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>net.kofnetwork.auth</groupId>
+        <artifactId>kofauth-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>kofauth-api</artifactId>
+    <name>KoFAuth-API</name>
+    <description>
+        Platform-neutral contracts: domain model, DTOs, service interfaces, repository interfaces,
+        events and result types. This module must never depend on an implementation library so that
+        Paper, Velocity, Spring and the bots can all compile against it.
+    </description>
+
+    <dependencies>
+        <!-- Deliberately minimal. slf4j-api is the single tolerated third-party type because
+             service contracts occasionally need to hand a logger to an extension point. -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+        </dependency>
+    </dependencies>
+</project>

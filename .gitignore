@@ -1,0 +1,43 @@
+# ---- Build output ----
+target/
+build/
+out/
+bin/
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+*.war
+*.class
+
+# ---- IDE ----
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+nbproject/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Runtime / secrets ----
+# Never commit a filled-in secrets file. Only the *.example templates are tracked.
+.env
+secrets.env
+*.local.yml
+run/
+logs/
+*.log
+
+# ---- Node (KoFAuth-Website) ----
+node_modules/
+dist/
+.parcel-cache/
+.vite/
+
+# ---- Docker volumes ----
+docker/data/

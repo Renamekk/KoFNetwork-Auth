@@ -1,0 +1,70 @@
+# =============================================================================
+#  KoFAuth REST API
+#
+#  Настройки самой БД, Redis и безопасности живут не здесь, а в каталоге
+#  kofauth.config-directory (те же YAML, что у плагинов). Это сделано намеренно:
+#  один набор файлов на всю сеть, а не отдельная копия настроек для веба.
+# =============================================================================
+
+server:
+  port: 8080
+  # Заголовок Server раскрывает версию контейнера — лишняя подсказка для сканеров.
+  server-header:
+  error:
+    # Стек в теле ответа рассказывает о внутреннем устройстве больше, чем следует.
+    include-stacktrace: never
+    include-message: never
+  compression:
+    enabled: true
+  forward-headers-strategy: NATIVE
+
+spring:
+  application:
+    name: kofauth-webapi
+  mvc:
+    problemdetails:
+      enabled: false
+  web:
+    resources:
+      static-locations: classpath:/static/
+      cache:
+        cachecontrol:
+          max-age: 3600
+  threads:
+    # Виртуальные потоки: обработчики почти всегда ждут ответа Core,
+    # а не считают. Платформенные потоки простаивали бы в блокировке.
+    virtual:
+      enabled: true
+
+kofauth:
+  # Каталог с config.yml, database.yml, security.yml и остальными.
+  config-directory: ./config
+  cors:
+    # Пусто = запросы только с того же источника, что раздаёт статику.
+    # Задавайте явно, если кабинет обслуживается с другого домена.
+    allowed-origins:
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+  api-docs:
+    path: /v3/api-docs
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Наружу только health: остальные эндпоинты раскрывают конфигурацию
+        # и метрики, которые незачем показывать миру.
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+      probes:
+        enabled: true
+
+logging:
+  level:
+    root: INFO
+    net.kofnetwork.auth: INFO

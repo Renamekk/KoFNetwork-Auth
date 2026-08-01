@@ -1,0 +1,14 @@
+name: KoFAuth
+version: '${project.version}'
+main: net.kofnetwork.auth.paper.KoFAuthPaper
+api-version: '1.21'
+authors: [KoF Network]
+description: Система авторизации сети KoF Network
+# Загружается до остальных плагинов: они не должны успеть обработать
+# неаутентифицированного игрока раньше защитных слушателей.
+load: STARTUP
+
+commands:
+  captcha:
+    description: Ввод кода текстовой CAPTCHA
+    usage: /captcha <код>

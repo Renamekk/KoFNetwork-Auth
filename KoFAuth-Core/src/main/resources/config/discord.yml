@@ -1,0 +1,52 @@
+# =============================================================================
+#  KoFAuth — Discord-бот
+#
+#  Секреты задавайте переменными окружения:
+#    KOFAUTH_DISCORD_BOT_TOKEN
+#    KOFAUTH_DISCORD_OAUTH_CLIENT_SECRET
+# =============================================================================
+
+enabled: false
+
+bot:
+  token: ""
+  # Сервер, на котором регистрируются slash-команды.
+  # Пусто — регистрировать глобально (обновление занимает до часа против
+  # мгновенного на конкретном сервере).
+  guild-id: ""
+
+oauth:
+  # OAuth2 нужен только для привязки с сайта. Привязка через бота работает без него.
+  enabled: false
+  client-id: ""
+  client-secret: ""
+  redirect-uri: "https://kofnetwork.net/api/discord/callback"
+  # identify достаточно для получения идентификатора и ника.
+  # email запрашивать не следует: он нам не нужен, а согласие пользователя усложняет.
+  scopes:
+    - identify
+
+link:
+  code-ttl: 15m
+  code-length: 8
+
+login-approval:
+  enabled: true
+  timeout: 2m
+  show-location: true
+
+notifications:
+  new-login: true
+  new-device: true
+  password-changed: true
+  binding-changed: true
+  suspicious-activity: true
+  account-locked: true
+
+roles:
+  # Выдавать роль Discord после привязки аккаунта.
+  grant-on-link: false
+  linked-role-id: ""
+
+# Канал для уведомлений администраторов об инцидентах.
+admin-channel-id: ""

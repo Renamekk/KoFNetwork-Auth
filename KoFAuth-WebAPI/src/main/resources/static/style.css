@@ -1,0 +1,196 @@
+/* KoF Network — личный кабинет.
+   Без сборщика и без зависимостей: CSP запрещает сторонние источники,
+   а один статический файл проще сопровождать, чем цепочку сборки. */
+
+:root {
+    --bg: #14161c;
+    --card: #1c1f28;
+    --line: #2a2e3a;
+    --text: #e6e8ee;
+    --muted: #8b93a7;
+    --accent: #5b6bff;
+    --ok: #3ecf8e;
+    --warn: #f5a623;
+    --err: #ff5f56;
+    --radius: 10px;
+}
+
+@media (prefers-color-scheme: light) {
+    :root {
+        --bg: #f4f5f8;
+        --card: #ffffff;
+        --line: #e2e5ec;
+        --text: #1b1e26;
+        --muted: #6b7280;
+    }
+}
+
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+}
+
+header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 18px 20px;
+    border-bottom: 1px solid var(--line);
+}
+
+header h1 { margin: 0; font-size: 20px; letter-spacing: .5px; }
+header h1 span { color: var(--accent); }
+
+main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 24px 16px 64px;
+}
+
+.card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 20px;
+    margin-bottom: 16px;
+}
+
+h2 { margin: 0 0 16px; font-size: 19px; }
+h3 { margin: 22px 0 10px; font-size: 15px; color: var(--muted); font-weight: 600; }
+h3:first-child { margin-top: 0; }
+
+label {
+    display: block;
+    margin-bottom: 14px;
+    font-size: 13px;
+    color: var(--muted);
+}
+
+input {
+    display: block;
+    width: 100%;
+    margin-top: 6px;
+    padding: 10px 12px;
+    font: inherit;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+}
+
+input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+button {
+    padding: 10px 18px;
+    font: inherit;
+    font-weight: 600;
+    color: #fff;
+    background: var(--accent);
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+button:hover { filter: brightness(1.1); }
+button:disabled { opacity: .5; cursor: default; }
+
+button.ghost {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--line);
+}
+
+button.danger { background: var(--err); }
+
+.links { margin: 14px 0 0; font-size: 13px; color: var(--muted); }
+.links a { color: var(--accent); text-decoration: none; }
+.links a:hover { text-decoration: underline; }
+
+.hidden { display: none !important; }
+
+/* Оценка защищённости */
+.score { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.bar { flex: 1; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.bar > div { height: 100%; background: var(--ok); transition: width .3s; }
+.score span { font-size: 13px; color: var(--muted); white-space: nowrap; }
+
+dl { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; margin: 0; font-size: 14px; }
+dt { color: var(--muted); }
+dd { margin: 0; }
+
+/* Вкладки */
+.tabs { display: flex; gap: 6px; margin-bottom: 16px; overflow-x: auto; }
+.tabs button {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--line);
+    white-space: nowrap;
+}
+.tabs button.active { color: #fff; background: var(--accent); border-color: var(--accent); }
+
+/* Списки */
+.list { list-style: none; margin: 0; padding: 0; }
+
+.list li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--line);
+    font-size: 14px;
+}
+
+.list li:last-child { border-bottom: none; }
+.list .meta { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
+.list .tag { font-size: 11px; padding: 2px 7px; border-radius: 20px; background: var(--line); }
+.tag.ok { background: rgba(62, 207, 142, .18); color: var(--ok); }
+.tag.warn { background: rgba(245, 166, 35, .18); color: var(--warn); }
+.tag.err { background: rgba(255, 95, 86, .18); color: var(--err); }
+
+.row-between { display: flex; align-items: center; justify-content: space-between; }
+.empty { color: var(--muted); font-size: 14px; padding: 10px 0; }
+
+/* Резервные коды и QR */
+.codes {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 8px;
+    margin: 12px 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+}
+.codes span { padding: 7px 9px; background: var(--bg); border-radius: 6px; text-align: center; }
+.qr { display: block; width: 190px; height: 190px; margin: 12px 0; border-radius: 8px; }
+
+/* Уведомления */
+.toast {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    max-width: 90vw;
+    padding: 12px 18px;
+    font-size: 14px;
+    color: #fff;
+    background: #333;
+    border-radius: 8px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, .35);
+    z-index: 50;
+}
+
+.toast.ok { background: #2a8f65; }
+.toast.err { background: #c8433b; }
+
+@media (max-width: 480px) {
+    .list li { flex-direction: column; align-items: flex-start; }
+    dl { grid-template-columns: 1fr; gap: 2px 0; }
+    dt { margin-top: 8px; }
+}

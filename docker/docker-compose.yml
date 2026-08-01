@@ -1,0 +1,156 @@
+# =============================================================================
+#  KoFAuth — инфраструктура и сервисы.
+#
+#  Запуск:
+#    cd docker && cp .env.example .env && <заполнить секреты> && docker compose up -d
+#
+#  Игровые серверы (Velocity, Paper) сюда не входят: их разворачивают отдельно,
+#  а плагины подключаются к этим же MySQL и Redis.
+# =============================================================================
+
+name: kofauth
+
+services:
+
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?требуется в .env}
+      MYSQL_DATABASE: kofauth
+      MYSQL_USER: kofauth
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?требуется в .env}
+      TZ: UTC
+    command:
+      # Схема рассчитана на utf8mb4: без этого ники с не-ASCII символами
+      # сохранятся с потерями.
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      # Часовой пояс сервера — UTC. Все DATETIME(3) в схеме хранятся в UTC,
+      # и локальный пояс контейнера сдвинул бы время входов.
+      - --default-time-zone=+00:00
+      - --max-connections=200
+      # Пул буферов: основная память MySQL. 512 МБ хватает схеме KoFAuth
+      # при нескольких миллионах строк истории.
+      - --innodb-buffer-pool-size=512M
+    volumes:
+      - mysql-data:/var/lib/mysql
+    ports:
+      # Наружу открыт только для доступа игровых серверов. В одной сети
+      # с ними эту строку следует убрать.
+      - "${MYSQL_PORT:-3306}:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?требуется в .env}
+      # Сохранение на диск отключено намеренно: в Redis лежат только сессии
+      # и кэш. Потеря при перезапуске означает повторный вход игроков,
+      # а не потерю данных — источник истины в MySQL.
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      # При заполнении вытесняем давно не использованное вместо отказа в записи.
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-512mb}
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - redis-data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "$$REDIS_PASSWORD", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  webapi:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        MODULE: KoFAuth-WebAPI
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment: &kofauth-env
+      KOFAUTH_DATABASE_MYSQL_HOST: mysql
+      KOFAUTH_DATABASE_MYSQL_PORT: "3306"
+      KOFAUTH_DATABASE_MYSQL_DATABASE: kofauth
+      KOFAUTH_DATABASE_MYSQL_USERNAME: kofauth
+      KOFAUTH_DATABASE_MYSQL_PASSWORD: ${MYSQL_PASSWORD:?}
+      KOFAUTH_DATABASE_REDIS_HOST: redis
+      KOFAUTH_DATABASE_REDIS_PORT: "6379"
+      KOFAUTH_DATABASE_REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+      KOFAUTH_SECURITY_ENCRYPTION_KEY: ${ENCRYPTION_KEY:?требуется в .env}
+      KOFAUTH_SECURITY_JWT_SECRET: ${JWT_SECRET:?требуется в .env}
+      KOFAUTH_MAIL_SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+    volumes:
+      - ./config:/app/config
+    ports:
+      - "${WEBAPI_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  telegram:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        MODULE: KoFAuth-Telegram
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *kofauth-env
+      KOFAUTH_TELEGRAM_ENABLED: "true"
+      KOFAUTH_TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?требуется в .env}
+    volumes:
+      - ./config:/app/config
+    # Бот не нужен, пока не задан токен: docker compose --profile bots up
+    profiles: [bots]
+
+  discord:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        MODULE: KoFAuth-Discord
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *kofauth-env
+      KOFAUTH_DISCORD_ENABLED: "true"
+      KOFAUTH_DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:?требуется в .env}
+    volumes:
+      - ./config:/app/config
+    profiles: [bots]
+
+volumes:
+  mysql-data:
+  redis-data:

@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>KoF Network — личный кабинет</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+    <h1>KoF<span>Auth</span></h1>
+    <button id="logout" class="ghost hidden">Выйти</button>
+</header>
+
+<main>
+    <!-- Вход -->
+    <section id="view-login" class="card">
+        <h2>Вход</h2>
+        <form id="form-login" autocomplete="on">
+            <label>Ник
+                <input name="username" required maxlength="16" autocomplete="username">
+            </label>
+            <label>Пароль
+                <input name="password" type="password" required autocomplete="current-password">
+            </label>
+            <label id="field-totp" class="hidden">Код из приложения
+                <input name="twoFactorCode" inputmode="numeric" autocomplete="one-time-code">
+            </label>
+            <button type="submit">Войти</button>
+        </form>
+        <p class="links">
+            <a href="#" id="to-register">Создать аккаунт</a> ·
+            <a href="#" id="to-forgot">Забыли пароль?</a>
+        </p>
+    </section>
+
+    <!-- Регистрация -->
+    <section id="view-register" class="card hidden">
+        <h2>Регистрация</h2>
+        <form id="form-register">
+            <label>Ник
+                <input name="username" required minlength="3" maxlength="16"
+                       pattern="[A-Za-z0-9_]+" autocomplete="username">
+            </label>
+            <label>Пароль
+                <input name="password" type="password" required autocomplete="new-password">
+            </label>
+            <label>Пароль ещё раз
+                <input name="passwordConfirmation" type="password" required
+                       autocomplete="new-password">
+            </label>
+            <button type="submit">Создать</button>
+        </form>
+        <p class="links"><a href="#" id="to-login">Уже есть аккаунт</a></p>
+    </section>
+
+    <!-- Восстановление -->
+    <section id="view-forgot" class="card hidden">
+        <h2>Восстановление пароля</h2>
+        <form id="form-forgot">
+            <label>Ник
+                <input name="username" required maxlength="16">
+            </label>
+            <button type="submit">Отправить код</button>
+        </form>
+        <form id="form-reset" class="hidden">
+            <label>Код из письма
+                <input name="code" required inputmode="numeric" autocomplete="one-time-code">
+            </label>
+            <label>Новый пароль
+                <input name="newPassword" type="password" required autocomplete="new-password">
+            </label>
+            <button type="submit">Сменить пароль</button>
+        </form>
+        <p class="links"><a href="#" id="to-login-2">Вернуться ко входу</a></p>
+    </section>
+
+    <!-- Кабинет -->
+    <section id="view-account" class="hidden">
+        <div class="card">
+            <h2 id="account-name">—</h2>
+            <div class="score">
+                <div class="bar"><div id="score-fill"></div></div>
+                <span id="score-text">—</span>
+            </div>
+            <dl id="account-facts"></dl>
+        </div>
+
+        <nav class="tabs">
+            <button data-tab="sessions" class="active">Сессии</button>
+            <button data-tab="devices">Устройства</button>
+            <button data-tab="history">История</button>
+            <button data-tab="security">Безопасность</button>
+        </nav>
+
+        <div class="card" id="tab-sessions">
+            <div class="row-between">
+                <h3>Активные сессии</h3>
+                <button id="revoke-all" class="ghost">Выйти везде</button>
+            </div>
+            <ul id="list-sessions" class="list"></ul>
+        </div>
+
+        <div class="card hidden" id="tab-devices">
+            <h3>Известные устройства</h3>
+            <ul id="list-devices" class="list"></ul>
+        </div>
+
+        <div class="card hidden" id="tab-history">
+            <h3>История входов</h3>
+            <ul id="list-history" class="list"></ul>
+        </div>
+
+        <div class="card hidden" id="tab-security">
+            <h3>Почта</h3>
+            <div id="email-block"></div>
+
+            <h3>Двухфакторная аутентификация</h3>
+            <div id="totp-block"></div>
+
+            <h3>Мессенджеры</h3>
+            <div id="link-block"></div>
+
+            <h3>Смена пароля</h3>
+            <form id="form-password">
+                <label>Текущий пароль
+                    <input name="currentPassword" type="password" required
+                           autocomplete="current-password">
+                </label>
+                <label>Новый пароль
+                    <input name="newPassword" type="password" required autocomplete="new-password">
+                </label>
+                <label>Новый пароль ещё раз
+                    <input name="newPasswordConfirmation" type="password" required
+                           autocomplete="new-password">
+                </label>
+                <button type="submit">Сменить</button>
+            </form>
+        </div>
+    </section>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
