@@ -65,6 +65,22 @@ public final class TokenServiceImpl implements TokenService {
                                                           @NotNull TokenType type,
                                                           @Nullable IpAddress ip,
                                                           @Nullable Duration customLifetime) {
+        return issue(accountId, type, ip, customLifetime, null);
+    }
+
+    /**
+     * Выпуск токена с необязательной привязкой к сессии.
+     *
+     * <p>Привязка задаётся здесь, а не отдельным шагом после вставки: {@code insert}
+     * создаёт строку, а не изменяет её, поэтому «вставить и дописать sessionId»
+     * означало бы две строки с одним и тем же хэшем — и отказ по уникальному
+     * индексу {@code uk_tokens_hash}.
+     */
+    private CompletableFuture<IssuedToken> issue(@Nullable Long accountId,
+                                                 @NotNull TokenType type,
+                                                 @Nullable IpAddress ip,
+                                                 @Nullable Duration customLifetime,
+                                                 @Nullable Long sessionId) {
         // Сырое значение существует только здесь и в ответе вызывающему.
         // В базу уходит его SHA-256.
         String raw = switch (type) {
@@ -88,6 +104,9 @@ public final class TokenServiceImpl implements TokenService {
         AuthToken token = AuthToken.issue(accountId, type, TokenGenerator.hash(raw), ip);
         if (customLifetime != null) {
             token = token.withExpiry(token.issuedAt().plus(customLifetime));
+        }
+        if (sessionId != null) {
+            token = token.withSessionId(sessionId);
         }
         return tokens.insert(token).thenApply(saved -> new IssuedToken(raw, saved));
     }
@@ -167,14 +186,12 @@ public final class TokenServiceImpl implements TokenService {
                 String username = account.map(a -> a.username()).orElse("unknown");
                 String access = jwt.issueAccessToken(accountId, username, publicId);
 
-                return issue(accountId, TokenType.REFRESH, ip, refreshLifetime())
-                        .thenCompose(issued -> tokens
-                                .insert(issued.token().withSessionId(sessionId))
-                                .thenApply(ignored -> new TokenPair(
-                                        access,
-                                        issued.value(),
-                                        jwt.accessLifetime(),
-                                        refreshLifetime())));
+                return issue(accountId, TokenType.REFRESH, ip, refreshLifetime(), sessionId)
+                        .thenApply(issued -> new TokenPair(
+                                access,
+                                issued.value(),
+                                jwt.accessLifetime(),
+                                refreshLifetime()));
             });
         });
     }

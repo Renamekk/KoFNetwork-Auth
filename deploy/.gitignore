@@ -1,0 +1,5 @@
+# Секреты и всё, что создаётся на сервере.
+.env
+artifacts/*.jar
+data/
+backups/

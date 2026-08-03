@@ -1,0 +1,423 @@
+# =============================================================================
+#  KoFAuth — весь стек одной командой.
+#
+#  Здесь лежит ВСЁ, что нужно сети: база, кэш, веб-API с личным кабинетом,
+#  прокси Velocity, Limbo и лобби на Paper, боты Telegram и Discord, HTTPS.
+#
+#  Обычный запуск:  ./install.sh   (создаст .env, соберёт jar, поднимет стек)
+#  Дальше:          ./kofauth.sh start | stop | logs | status | update
+#
+#  Профили:
+#    (без профиля) — mysql, redis, webapi, velocity, limbo, lobby — игровая сеть
+#    bots          — telegram, discord
+#    web           — caddy, HTTPS для личного кабинета
+#    build         — разовая сборка jar, вызывается install.sh, не поднимается
+# =============================================================================
+
+name: kofauth
+
+# ---------------------------------------------------------------- общие блоки
+
+# Настройки KoFAuth, одинаковые для всех процессов сети. Пустое значение
+# переменной окружения KoFAuth игнорирует и берёт значение из YAML —
+# поэтому необязательные ключи можно передавать пустыми.
+x-kofauth-env: &kofauth-env
+  KOFAUTH_DATABASE_MYSQL_HOST: mysql
+  KOFAUTH_DATABASE_MYSQL_PORT: "3306"
+  KOFAUTH_DATABASE_MYSQL_DATABASE: kofauth
+  KOFAUTH_DATABASE_MYSQL_USERNAME: kofauth
+  KOFAUTH_DATABASE_MYSQL_PASSWORD: ${MYSQL_PASSWORD:?нет в .env — запустите ./install.sh}
+  # Миграции применяет ровно один процесс — webapi. Остальные ждут его
+  # готовности через depends_on. Одновременный запуск Flyway из пяти процессов
+  # не сломается (есть блокировка), но диагностировать его сложнее, чем
+  # один явно назначенный источник изменений схемы.
+  KOFAUTH_DATABASE_MYSQL_MIGRATE_ON_STARTUP: "false"
+  KOFAUTH_DATABASE_REDIS_ENABLED: "true"
+  KOFAUTH_DATABASE_REDIS_HOST: redis
+  KOFAUTH_DATABASE_REDIS_PORT: "6379"
+  KOFAUTH_DATABASE_REDIS_PASSWORD: ${REDIS_PASSWORD:?нет в .env — запустите ./install.sh}
+  KOFAUTH_DATABASE_REDIS_DATABASE: "0"
+  KOFAUTH_SECURITY_ENCRYPTION_KEY: ${ENCRYPTION_KEY:?нет в .env — запустите ./install.sh}
+  KOFAUTH_SECURITY_JWT_SECRET: ${JWT_SECRET:?нет в .env — запустите ./install.sh}
+  # Почта. Пока SMTP_HOST пуст, почтовые возможности выключены —
+  # восстановление пароля и уведомления работать не будут, остальное будет.
+  KOFAUTH_MAIL_ENABLED: ${MAIL_ENABLED:-false}
+  KOFAUTH_MAIL_SMTP_HOST: ${SMTP_HOST:-}
+  KOFAUTH_MAIL_SMTP_PORT: ${SMTP_PORT:-587}
+  KOFAUTH_MAIL_SMTP_USERNAME: ${SMTP_USERNAME:-}
+  KOFAUTH_MAIL_SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  KOFAUTH_MAIL_SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
+  KOFAUTH_MAIL_SMTP_SSL: ${SMTP_SSL:-false}
+  KOFAUTH_MAIL_FROM_ADDRESS: ${MAIL_FROM:-noreply@example.com}
+  KOFAUTH_MAIL_FROM_NAME: ${MAIL_FROM_NAME:-KoF Network}
+  # Подробность логов процессов KoFAuth: INFO, DEBUG, WARN.
+  # DEBUG включают на время разбора и снимают: он пишет каждое обращение к базе.
+  KOFAUTH_LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  TZ: UTC
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+# Общий шаблон java-процесса: jar монтируется готовым, образ пересобирать не нужно.
+x-java-service: &java-service
+  image: eclipse-temurin:21-jre
+  restart: unless-stopped
+  working_dir: /app
+  networks: [kofauth]
+  logging: *logging
+
+services:
+
+  # =========================================================== хранилище
+
+  mysql:
+    image: mysql:8.0.46
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?нет в .env — запустите ./install.sh}
+      MYSQL_DATABASE: kofauth
+      MYSQL_USER: kofauth
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?}
+      TZ: UTC
+    command:
+      # Схема рассчитана на utf8mb4: без этого ники с не-ASCII символами
+      # сохранятся с потерями.
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      # Все DATETIME(3) в схеме хранятся в UTC. Локальный пояс контейнера
+      # сдвинул бы время входов и сроки жизни сессий.
+      - --default-time-zone=+00:00
+      - --max-connections=${MYSQL_MAX_CONNECTIONS:-200}
+      - --innodb-buffer-pool-size=${MYSQL_BUFFER_POOL:-512M}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks: [kofauth]
+    # Порт наружу не публикуется намеренно: база доступна только контейнерам
+    # этой сети. Для консоли есть ./kofauth.sh db
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_ROOT_PASSWORD\" mysqladmin ping -h 127.0.0.1 -u root --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 45s
+    logging: *logging
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    # Сохранение на диск выключено намеренно: в Redis лежат только сессии и кэш.
+    # Потеря при перезапуске означает повторный вход игроков, а не потерю данных —
+    # источник истины в MySQL.
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\" --save '' --appendonly no --maxmemory ${REDIS_MAXMEMORY:-256mb} --maxmemory-policy allkeys-lru"]
+    networks: [kofauth]
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli -h 127.0.0.1 ping | grep -qx PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    logging: *logging
+
+  # =========================================================== веб-API и сайт
+
+  # Стартует первым из процессов KoFAuth и применяет миграции: остальные
+  # подключаются к готовой схеме.
+  webapi:
+    <<: *java-service
+    depends_on:
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    environment:
+      <<: *kofauth-env
+      KOFAUTH_DATABASE_MYSQL_MIGRATE_ON_STARTUP: "true"
+      # Доверять заголовку с реальным IP можно ТОЛЬКО когда перед сервисом
+      # действительно стоит обратный прокси. Иначе клиент подставит любой адрес
+      # и обойдёт ограничение скорости, привязку сессии к IP и баны.
+      KOFAUTH_VELOCITY_FORWARDING_TRUST_PROXY_HEADER: ${TRUST_PROXY_HEADER:-false}
+      KOFAUTH_VELOCITY_FORWARDING_HEADER_NAME: X-Forwarded-For
+      KOFAUTH_DISCORD_OAUTH_ENABLED: ${DISCORD_OAUTH_ENABLED:-false}
+      KOFAUTH_DISCORD_OAUTH_CLIENT_ID: ${DISCORD_OAUTH_CLIENT_ID:-}
+      KOFAUTH_DISCORD_OAUTH_CLIENT_SECRET: ${DISCORD_OAUTH_CLIENT_SECRET:-}
+      KOFAUTH_DISCORD_OAUTH_REDIRECT_URI: ${DISCORD_OAUTH_REDIRECT_URI:-}
+      # Spring, а не KoFAuth: имя без дефисов — так работает relaxed binding.
+      KOFAUTH_CORS_ALLOWEDORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=70 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -Duser.timezone=UTC
+    command: ["java", "-jar", "/app/app.jar", "--kofauth.config-directory=/app/config"]
+    volumes:
+      - ./artifacts/kofauth-webapi.jar:/app/app.jar:ro
+      - ./data/config:/app/config
+    ports:
+      - "${WEBAPI_BIND:-0.0.0.0}:${WEBAPI_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/actuator/health | grep -q '\"status\":\"UP\"'"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  # =========================================================== игровая сеть
+
+  velocity:
+    image: itzg/mc-proxy:2025.10.0-java21
+    restart: unless-stopped
+    depends_on:
+      webapi: {condition: service_healthy}
+    environment:
+      <<: *kofauth-env
+      KOFAUTH_VELOCITY_LIMBO_SERVERS: limbo-1
+      KOFAUTH_VELOCITY_LOBBY_SERVERS: lobby-1
+      TYPE: VELOCITY
+      VELOCITY_VERSION: 3.4.0-SNAPSHOT
+      VELOCITY_BUILD_ID: "563"
+      MEMORY: ${HEAP_VELOCITY:-512M}
+      ENABLE_RCON: "false"
+      SERVER_PORT: "25565"
+      # Подстановка переменных в файлы из /config: секрет форвардинга
+      # не должен лежать в git.
+      REPLACE_ENV_VARIABLES: "true"
+      REPLACE_ENV_DURING_SYNC: "true"
+      REPLACE_ENV_VARIABLE_PREFIX: CFG_
+      REPLACE_ENV_SUFFIXES: yml,yaml,txt,cfg,conf,properties,json,toml,secret
+      SYNC_SKIP_NEWER_IN_DESTINATION: "false"
+      # Velocity читает секрет из этой переменной, а файл forwarding.secret
+      # остаётся запасным путём. Так секрет гарантированно побайтно совпадает
+      # с тем, что получает Paper: лишний перевод строки в файле сделал бы
+      # форвардинг нерабочим, а сообщение об этом появилось бы только у игрока.
+      VELOCITY_FORWARDING_SECRET: ${FORWARDING_SECRET:?}
+      CFG_FORWARDING_SECRET: ${FORWARDING_SECRET:?нет в .env — запустите ./install.sh}
+      CFG_MOTD: ${MOTD:-<#d4af37>KoF Network}
+      CFG_MAX_PLAYERS: ${MAX_PLAYERS:-500}
+    volumes:
+      - velocity-data:/server
+      - ./config/velocity:/config:ro
+      - ./artifacts/kofauth-velocity.jar:/plugins/kofauth-velocity.jar:ro
+    ports:
+      - "${MINECRAFT_PORT:-25565}:25565/tcp"
+    networks: [kofauth]
+    # Консоль прокси: ./kofauth.sh console — там выполняются команды /auth
+    stdin_open: true
+    tty: true
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/bin/health.sh && grep -Fq 'KoFAuth запущен на прокси' /server/logs/latest.log"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+    stop_grace_period: 60s
+    logging: *logging
+
+  limbo:
+    image: itzg/minecraft-server:2026.5.4-java21
+    restart: unless-stopped
+    depends_on:
+      velocity: {condition: service_healthy}
+    environment:
+      <<: *kofauth-env
+      KOFAUTH_PAPER_MODE: LIMBO
+      EULA: "TRUE"
+      TYPE: PAPER
+      VERSION: ${PAPER_VERSION:-1.21.8}
+      PAPER_BUILD: ${PAPER_BUILD:-60}
+      MEMORY: ${HEAP_LIMBO:-768M}
+      # Прямые подключения в обход прокси отсекает форвардинг Velocity,
+      # он же передаёт настоящий UUID игрока.
+      ONLINE_MODE: "FALSE"
+      ENFORCE_SECURE_PROFILE: "FALSE"
+      PAPER_VELOCITY_SECRET: ${FORWARDING_SECRET:?}
+      ENABLE_RCON: "FALSE"
+      ENABLE_QUERY: "FALSE"
+      SERVER_PORT: "25565"
+      MAX_PLAYERS: ${MAX_PLAYERS:-500}
+      # Смотреть в Limbo не на что, а при заходе ботнета каждый чанк —
+      # это трафик и память.
+      VIEW_DISTANCE: "2"
+      SIMULATION_DISTANCE: "2"
+      SPAWN_PROTECTION: "0"
+      DIFFICULTY: peaceful
+      MODE: adventure
+      MOTD: KoF Network Limbo
+    volumes:
+      - limbo-data:/data
+      - ./artifacts/kofauth-paper.jar:/plugins/kofauth-paper.jar:ro
+    networks: [kofauth]
+    healthcheck:
+      test: ["CMD-SHELL", "mc-health && grep -Fq 'Режим работы: LIMBO' /data/logs/latest.log && grep -Fq 'KoFAuth запущен' /data/logs/latest.log && ! grep -Fq 'KoFAuth не запустился' /data/logs/latest.log"]
+      interval: 15s
+      timeout: 5s
+      retries: 24
+      start_period: 150s
+    stop_grace_period: 60s
+    logging: *logging
+
+  lobby:
+    image: itzg/minecraft-server:2026.5.4-java21
+    restart: unless-stopped
+    depends_on:
+      limbo: {condition: service_healthy}
+    environment:
+      <<: *kofauth-env
+      KOFAUTH_PAPER_MODE: BACKEND
+      KOFAUTH_PAPER_BACKEND_VERIFY_SESSION: "true"
+      EULA: "TRUE"
+      TYPE: PAPER
+      VERSION: ${PAPER_VERSION:-1.21.8}
+      PAPER_BUILD: ${PAPER_BUILD:-60}
+      MEMORY: ${HEAP_LOBBY:-2G}
+      ONLINE_MODE: "FALSE"
+      ENFORCE_SECURE_PROFILE: "FALSE"
+      PAPER_VELOCITY_SECRET: ${FORWARDING_SECRET:?}
+      ENABLE_RCON: "TRUE"
+      RCON_PASSWORD: ${RCON_PASSWORD:?нет в .env — запустите ./install.sh}
+      ENABLE_QUERY: "FALSE"
+      SERVER_PORT: "25565"
+      MAX_PLAYERS: ${MAX_PLAYERS:-500}
+      VIEW_DISTANCE: ${LOBBY_VIEW_DISTANCE:-8}
+      SIMULATION_DISTANCE: ${LOBBY_SIMULATION_DISTANCE:-6}
+      SPAWN_PROTECTION: "0"
+      DIFFICULTY: ${LOBBY_DIFFICULTY:-normal}
+      MODE: ${LOBBY_GAMEMODE:-survival}
+      MOTD: KoF Network Lobby
+    volumes:
+      - lobby-data:/data
+      - ./artifacts/kofauth-paper.jar:/plugins/kofauth-paper.jar:ro
+    networks: [kofauth]
+    healthcheck:
+      test: ["CMD-SHELL", "mc-health && grep -Fq 'Режим работы: BACKEND' /data/logs/latest.log && grep -Fq 'KoFAuth запущен' /data/logs/latest.log && ! grep -Fq 'KoFAuth не запустился' /data/logs/latest.log"]
+      interval: 15s
+      timeout: 5s
+      retries: 24
+      start_period: 180s
+    stop_grace_period: 60s
+    logging: *logging
+
+  # =========================================================== боты
+
+  # Профиля два: telegram — только этот бот, bots — оба сразу.
+  # Служба поднимается, если включён любой из них.
+  telegram:
+    <<: *java-service
+    profiles: [bots, telegram]
+    depends_on:
+      webapi: {condition: service_healthy}
+    environment:
+      <<: *kofauth-env
+      KOFAUTH_TELEGRAM_ENABLED: "true"
+      # Без токена процесс сам напишет в лог, чего не хватает, и завершится.
+      KOFAUTH_TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      KOFAUTH_TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
+      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=70 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -Duser.timezone=UTC
+    command: ["java", "-jar", "/app/app.jar", "/app/config"]
+    volumes:
+      - ./artifacts/kofauth-telegram.jar:/app/app.jar:ro
+      - ./data/config:/app/config
+
+  discord:
+    <<: *java-service
+    profiles: [bots, discord]
+    depends_on:
+      webapi: {condition: service_healthy}
+    environment:
+      <<: *kofauth-env
+      KOFAUTH_DISCORD_ENABLED: "true"
+      KOFAUTH_DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      KOFAUTH_DISCORD_BOT_GUILD_ID: ${DISCORD_GUILD_ID:-}
+      KOFAUTH_DISCORD_OAUTH_ENABLED: ${DISCORD_OAUTH_ENABLED:-false}
+      KOFAUTH_DISCORD_OAUTH_CLIENT_ID: ${DISCORD_OAUTH_CLIENT_ID:-}
+      KOFAUTH_DISCORD_OAUTH_CLIENT_SECRET: ${DISCORD_OAUTH_CLIENT_SECRET:-}
+      KOFAUTH_DISCORD_OAUTH_REDIRECT_URI: ${DISCORD_OAUTH_REDIRECT_URI:-}
+      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=70 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -Duser.timezone=UTC
+    command: ["java", "-jar", "/app/app.jar", "/app/config"]
+    volumes:
+      - ./artifacts/kofauth-discord.jar:/app/app.jar:ro
+      - ./data/config:/app/config
+
+  # =========================================================== HTTPS
+
+  # Сертификат Let's Encrypt Caddy получает и продлевает сам. Нужен домен,
+  # указывающий на этот сервер, и свободные порты 80 и 443.
+  caddy:
+    image: caddy:2-alpine
+    profiles: [web]
+    restart: unless-stopped
+    depends_on:
+      webapi: {condition: service_started}
+    environment:
+      # Без домена Caddy выпустит самоподписанный сертификат на localhost —
+      # работать будет, но браузер предупредит.
+      DOMAIN: ${DOMAIN:-localhost}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./config/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+    networks: [kofauth]
+    logging: *logging
+
+  # =========================================================== сборка
+
+  # Одноразовая сборка jar внутри Docker: Java и Maven на сервере не нужны.
+  # Вызывается install.sh и kofauth.sh update, сам по себе не поднимается.
+  builder:
+    profiles: [build]
+    image: eclipse-temurin:21-jdk
+    working_dir: /src
+    volumes:
+      - ../:/src
+      - maven-cache:/m2
+      - ./artifacts:/artifacts
+    environment:
+      # И зависимости, и сам дистрибутив Maven кладём в том: иначе каждая
+      # пересборка заново тянет ~200 МБ из сети.
+      MAVEN_USER_HOME: /m2
+      MAVEN_OPTS: -Dmaven.repo.local=/m2/repository
+    command:
+      - bash
+      - -euc
+      - |
+        echo "==> Сборка модулей KoFAuth (тесты пропускаются: их место в CI)"
+        sh ./mvnw -B -ntp -DskipTests -Dmaven.repo.local=/m2/repository package
+        echo "==> Раскладка артефактов"
+        cp KoFAuth-Velocity/target/KoFAuth-Velocity-*.jar /artifacts/kofauth-velocity.jar
+        cp KoFAuth-Paper/target/KoFAuth-Paper-*.jar       /artifacts/kofauth-paper.jar
+        cp KoFAuth-WebAPI/target/KoFAuth-WebAPI-*.jar     /artifacts/kofauth-webapi.jar
+        cp KoFAuth-Telegram/target/KoFAuth-Telegram-*.jar /artifacts/kofauth-telegram.jar
+        cp KoFAuth-Discord/target/KoFAuth-Discord-*.jar   /artifacts/kofauth-discord.jar
+        # Дескриптор плагина Velocity генерируется аннотационным процессором.
+        # С JDK 22+ он молча не запускается без -proc:full, и тогда сборка
+        # зелёная, jar на месте, а плагин прокси не виден вовсе.
+        jar tf /artifacts/kofauth-velocity.jar | grep -qx velocity-plugin.json \
+          || { echo "ОШИБКА: в jar нет velocity-plugin.json — плагин не запустится"; exit 1; }
+        # Реализация SLF4J: без неё процесс запускается и работает, но не пишет
+        # ни одной строки лога — включая ошибки хранилища и события безопасности.
+        # В webapi это вложенный jar, в ботах — распакованные классы shade-плагина.
+        # Доллар удваивается: compose подставляет переменные и в тело команды,
+        # и одинарный $$m превратился бы в пустую строку ещё до запуска shell.
+        for m in webapi telegram discord; do
+          jar tf /artifacts/kofauth-$$m.jar \
+            | grep -qE 'logback-classic|ch/qos/logback/classic/Logger.class' \
+            || { echo "ОШИБКА: в jar $$m нет реализации SLF4J — процесс будет работать без логов"; exit 1; }
+        done
+        chmod 0644 /artifacts/*.jar
+        ls -la /artifacts
+    networks: [kofauth]
+
+volumes:
+  mysql-data:
+  velocity-data:
+  limbo-data:
+  lobby-data:
+  caddy-data:
+  caddy-config:
+  maven-cache:
+
+networks:
+  kofauth:
+    driver: bridge

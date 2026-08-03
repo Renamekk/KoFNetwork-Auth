@@ -1,0 +1,31 @@
+# =============================================================================
+#  Caddy — HTTPS для личного кабинета и REST API.
+#
+#  Сертификат Let's Encrypt выпускается и продлевается автоматически.
+#  Условия: домен из DOMAIN указывает A-записью на этот сервер,
+#  порты 80 и 443 открыты и свободны.
+# =============================================================================
+
+{
+	email {$ACME_EMAIL}
+	# Сервер не должен представляться версией — лишняя подсказка сканерам.
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Реальный адрес клиента. KoFAuth доверяет заголовку только когда
+	# TRUST_PROXY_HEADER=true в .env — install.sh включает это вместе с профилем web.
+	reverse_proxy webapi:8080 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Real-IP {remote_host}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

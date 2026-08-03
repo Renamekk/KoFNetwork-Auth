@@ -23,7 +23,32 @@ REST API, Telegram- и Discord-боты, TOTP, личный кабинет.
 | [`KoFAuth-Discord`](KoFAuth-Discord) | Discord-бот: slash-команды, OAuth2 |
 | `KoFAuth-Website` | Личный кабинет (статика, раздаётся WebAPI) |
 
-## Сборка
+## Установка на сервер
+
+Нужен только SSH-доступ к серверу с Ubuntu или Debian. Java, Maven, MySQL и
+серверные ядра ставить не требуется — всё поднимается в Docker:
+
+```bash
+git clone https://github.com/Renamekk/KoFNetwork-Auth.git
+cd KoFNetwork-Auth/deploy
+./install.sh
+```
+
+Скрипт поставит Docker при его отсутствии, сгенерирует все пароли и ключи,
+соберёт jar в контейнере и поднимет сеть: прокси Velocity, Limbo, лобби,
+MySQL, Redis, REST API с личным кабинетом. Через 10–20 минут можно заходить
+в игру на `IP:25565` и регистрироваться.
+
+Пошагово, с доменом, ботами, почтой и разбором ошибок —
+**[docs/05-QUICKSTART.md](docs/05-QUICKSTART.md)**.
+
+Дальнейшее управление:
+
+```bash
+./kofauth.sh status | logs | console | update | backup
+```
+
+## Сборка из исходников
 
 ```bash
 ./mvnw clean install -DskipTests
@@ -38,7 +63,7 @@ REST API, Telegram- и Discord-боты, TOTP, личный кабинет.
 ./mvnw clean install
 ```
 
-405 тестов: 305 модульных и 100 интеграционных. Последние поднимают настоящие
+406 тестов: 308 модульных и 98 интеграционных. Последние поднимают настоящие
 MySQL 8 и Redis 7 через Testcontainers, поэтому нужен запущенный Docker.
 Без него — `./mvnw clean install -DskipITs`.
 
@@ -47,13 +72,14 @@ MySQL 8 и Redis 7 через Testcontainers, поэтому нужен запу
 
 ## Документация
 
-| Документ | Этап |
+| Документ | О чём |
 |----------|------|
-| [01 — Архитектура](docs/01-ARCHITECTURE.md) | 1 |
-| [02 — База данных](docs/02-DATABASE.md) | 2 |
-| [03 — Развёртывание](docs/03-DEPLOYMENT.md) | 5–6 |
-| [04 — Эксплуатация](docs/04-PRODUCTION.md) | 16–17 |
-| [00 — Журнал разработки](docs/00-DEVELOPMENT-LOG.md) | все |
+| [05 — Установка на сервер](docs/05-QUICKSTART.md) | Пошагово: от пустого VPS до работающей сети |
+| [01 — Архитектура](docs/01-ARCHITECTURE.md) | Устройство системы, диаграммы |
+| [02 — База данных](docs/02-DATABASE.md) | Схема, 17 таблиц |
+| [03 — Развёртывание](docs/03-DEPLOYMENT.md) | Ручная установка, команды `/auth` |
+| [04 — Эксплуатация](docs/04-PRODUCTION.md) | Наблюдаемость, нагрузка, инциденты |
+| [00 — Журнал разработки](docs/00-DEVELOPMENT-LOG.md) | Что и почему сделано именно так |
 
 ## Статус разработки
 

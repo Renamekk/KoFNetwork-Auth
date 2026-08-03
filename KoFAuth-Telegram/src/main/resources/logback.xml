@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Логирование Telegram-бота.
+
+    Файл обязателен. Без него logback не находит конфигурации и включает
+    уровень DEBUG у корневого логгера: в вывод уходит уборка пула соединений
+    каждые тридцать секунд и «Getting updates» каждые пятьдесят. Полезные
+    строки в этом потоке не видны, а ротация логов заполняется служебной
+    возню́й вместо событий.
+-->
+<configuration>
+
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- Уровень приложения меняется переменной окружения без пересборки. -->
+    <logger name="net.kofnetwork.auth" level="${KOFAUTH_LOG_LEVEL:-INFO}"/>
+
+    <!-- Библиотеки: интересны только предупреждения и ошибки. -->
+    <logger name="com.zaxxer.hikari" level="WARN"/>
+    <logger name="io.lettuce" level="WARN"/>
+    <logger name="reactor" level="WARN"/>
+    <logger name="org.telegram" level="INFO"/>
+    <logger name="okhttp3" level="WARN"/>
+    <logger name="org.flywaydb" level="INFO"/>
+
+    <root level="INFO">
+        <appender-ref ref="STDOUT"/>
+    </root>
+
+</configuration>

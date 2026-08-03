@@ -17,6 +17,7 @@ import net.kofnetwork.auth.api.model.AuthState;
 import net.kofnetwork.auth.core.KoFAuthCore;
 import net.kofnetwork.auth.velocity.command.AuthAdminCommand;
 import net.kofnetwork.auth.velocity.command.EmailCommand;
+import net.kofnetwork.auth.velocity.command.LinkCommand;
 import net.kofnetwork.auth.velocity.command.LoginCommand;
 import net.kofnetwork.auth.velocity.command.RegisterCommand;
 import net.kofnetwork.auth.velocity.limbo.LimboRouter;
@@ -110,6 +111,23 @@ public final class KoFAuthVelocity {
                 .plugin(this)
                 .build();
         commands.register(email, new EmailCommand(core, messages, logger));
+
+        // Код привязки выдаётся в игре и вводится в мессенджере. Обратное
+        // направление позволило бы привязать свой Telegram к чужому нику:
+        // достаточно было бы знать ник.
+        CommandMeta telegram = commands.metaBuilder("telegram")
+                .aliases("tg", "телеграм")
+                .plugin(this)
+                .build();
+        commands.register(telegram,
+                new LinkCommand(core, LinkCommand.Kind.TELEGRAM, messages, logger));
+
+        CommandMeta discord = commands.metaBuilder("discord")
+                .aliases("ds", "дискорд")
+                .plugin(this)
+                .build();
+        commands.register(discord,
+                new LinkCommand(core, LinkCommand.Kind.DISCORD, messages, logger));
     }
 
     /**

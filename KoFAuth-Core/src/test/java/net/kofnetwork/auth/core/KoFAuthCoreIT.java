@@ -454,6 +454,53 @@ class KoFAuthCoreIT {
     }
 
     @Test
+    void пара_токенов_кабинета_выдаётся_и_привязывается_к_сессии() throws Exception {
+        RegistrationResult registered = core.registration()
+                .register(registration("Steve", "Korovka42Luna")).join();
+        long accountId = registered.account().id();
+        long sessionId = registered.session().id();
+
+        var pair = core.tokens().issueTokenPair(accountId, sessionId, CONTEXT.ip()).join();
+
+        assertThat(pair.accessToken()).isNotBlank();
+        assertThat(pair.refreshToken()).isNotBlank();
+
+        // Раньше выпуск состоял из двух вставок: сначала токен, потом «тот же
+        // токен, но с sessionId». insert создаёт строку, а не изменяет её, поэтому
+        // вторая падала по уникальному индексу uk_tokens_hash — и каждый вход
+        // в личный кабинет отвечал 503. Проверяем и число строк, и привязку.
+        try (Connection connection = core.database().connection();
+             var statement = connection.prepareStatement(
+                     "SELECT COUNT(*) AS n, MAX(session_id) AS sid FROM tokens "
+                             + "WHERE account_id = ? AND type = 'REFRESH'")) {
+            statement.setLong(1, accountId);
+            try (var rows = statement.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+                assertThat(rows.getInt("n")).isEqualTo(1);
+                assertThat(rows.getLong("sid")).isEqualTo(sessionId);
+            }
+        }
+    }
+
+    @Test
+    void две_пары_токенов_подряд_не_конфликтуют() {
+        RegistrationResult registered = core.registration()
+                .register(registration("Steve", "Korovka42Luna")).join();
+        long accountId = registered.account().id();
+        long sessionId = registered.session().id();
+
+        var first = core.tokens().issueTokenPair(accountId, sessionId, CONTEXT.ip()).join();
+        var second = core.tokens().issueTokenPair(accountId, sessionId, CONTEXT.ip()).join();
+
+        assertThat(first.refreshToken()).isNotEqualTo(second.refreshToken());
+        // Оба обязаны работать: вход с телефона не должен выбивать вход с ноутбука.
+        assertThat(core.tokens().refresh(first.refreshToken(), CONTEXT.ip()).join().isSuccess())
+                .isTrue();
+        assertThat(core.tokens().refresh(second.refreshToken(), CONTEXT.ip()).join().isSuccess())
+                .isTrue();
+    }
+
+    @Test
     void ограничение_скорости_срабатывает_по_адресу() {
         var verdict = core.security().checkAndConsume("login.per-ip", "203.0.113.250").join();
         assertThat(verdict.allowed()).isTrue();

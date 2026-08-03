@@ -1,0 +1,69 @@
+# =============================================================================
+#  Velocity — конфигурация прокси KoF Network.
+#
+#  Файл синхронизируется в контейнер при каждом запуске, ${CFG_*} подставляются
+#  из .env. Правьте здесь, а не внутри контейнера: том перезапишет изменения.
+# =============================================================================
+
+config-version = "2.8"
+
+bind = "0.0.0.0:25565"
+motd = "${CFG_MOTD}"
+show-max-players = ${CFG_MAX_PLAYERS}
+
+# Сеть работает с нелицензионными аккаунтами: проверку личности выполняет
+# KoFAuth по паролю, а не Mojang. При online-mode = true пароль был бы не нужен
+# и вся эта система тоже.
+online-mode = false
+force-key-authentication = false
+prevent-client-proxy-connections = false
+
+# modern — форвардинг Velocity: бэкенд получает настоящий UUID и IP игрока,
+# подписанные секретом. Без него любой сможет подключиться к Paper напрямую
+# под чужим ником.
+player-info-forwarding-mode = "modern"
+forwarding-secret-file = "forwarding.secret"
+
+announce-forge = false
+kick-existing-players = false
+ping-passthrough = "DISABLED"
+sample-players-in-ping = false
+enable-player-address-logging = true
+
+[servers]
+limbo-1 = "limbo:25565"
+lobby-1 = "lobby:25565"
+
+# try обязан указывать на Limbo. Окажись здесь лобби — игрок на мгновение
+# попал бы на боевой сервер до того, как отработает маршрутизация KoFAuth.
+try = ["limbo-1"]
+
+[forced-hosts]
+
+[advanced]
+compression-threshold = 256
+compression-level = -1
+login-ratelimit = 3000
+connection-timeout = 5000
+read-timeout = 30000
+haproxy-protocol = false
+tcp-fast-open = false
+bungee-plugin-message-channel = true
+show-ping-requests = false
+failover-on-unexpected-server-disconnect = true
+announce-proxy-commands = true
+log-command-executions = false
+log-player-connections = true
+accepts-transfers = false
+enable-reuse-port = false
+command-rate-limit = 50
+forward-commands-if-rate-limited = true
+kick-after-rate-limited-commands = 0
+tab-complete-rate-limit = 10
+kick-after-rate-limited-tab-completes = 0
+
+[query]
+enabled = false
+port = 25565
+map = "KoF Network"
+show-plugins = false

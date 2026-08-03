@@ -5,7 +5,6 @@ import org.bukkit.GameRule;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.WorldCreator;
-import org.bukkit.WorldType;
 import org.bukkit.generator.ChunkGenerator;
 import org.jetbrains.annotations.NotNull;
 
@@ -86,9 +85,13 @@ public final class LimboWorldFactory {
         }
 
         logger.info("Создание мира Limbo '" + name + "'...");
+        // Тип мира намеренно оставлен обычным. С WorldType.FLAT сервер пытается
+        // разобрать настройки суперплоского мира, которых у нас нет, и пишет при
+        // каждом запуске «No key layers in MapLike[{}]» уровнем ERROR. На создание
+        // мира это не влияет — чанки всё равно отдаёт VoidGenerator, — но ошибка
+        // в логе при исправном запуске приучает не смотреть на ошибки в логе.
         World world = new WorldCreator(name)
                 .generator(new VoidGenerator())
-                .type(WorldType.FLAT)
                 .generateStructures(false)
                 .createWorld();
 

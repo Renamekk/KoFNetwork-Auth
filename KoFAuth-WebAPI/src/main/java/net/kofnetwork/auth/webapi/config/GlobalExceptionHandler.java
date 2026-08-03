@@ -10,6 +10,8 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.NoHandlerFoundException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.concurrent.CompletionException;
 import java.util.stream.Collectors;
@@ -35,6 +37,23 @@ public class GlobalExceptionHandler {
                 .collect(Collectors.joining("; "));
         return ResponseEntity.badRequest()
                 .body(ApiDtos.ErrorResponse.of("VALIDATION_FAILED", details));
+    }
+
+    /**
+     * Несуществующий путь.
+     *
+     * <p>Без этого обработчика запрос к опечатанному адресу попадал в
+     * {@link #onAny(Exception)} и возвращал 500. Разница не косметическая:
+     * пятисотые поднимают тревогу в мониторинге и отправляют разбираться с
+     * «отказом сервиса» там, где клиент просто ошибся адресом. В лог такое
+     * пишется на уровне отладки — сканеры перебирают пути постоянно,
+     * и предупреждение на каждый из них скрывает настоящие ошибки.
+     */
+    @ExceptionHandler({NoResourceFoundException.class, NoHandlerFoundException.class})
+    public ResponseEntity<ApiDtos.ErrorResponse> onNotFound(Exception e) {
+        LOGGER.debug("Запрошен несуществующий путь: {}", e.getMessage());
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(ApiDtos.ErrorResponse.of("NOT_FOUND", "Адрес не найден"));
     }
 
     @ExceptionHandler(RepositoryException.class)

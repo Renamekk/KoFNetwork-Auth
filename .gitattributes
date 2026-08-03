@@ -1,0 +1,27 @@
+# Скрипты и конфигурация развёртывания исполняются в Linux-контейнерах.
+# Перевод строки CRLF ломает их молча: shell сообщает «command not found»
+# про строку, которая выглядит правильной, а YAML получает \r в конце значений.
+# Поэтому для всего, что попадает на сервер, перевод строки фиксирован — LF,
+# независимо от core.autocrlf на машине разработчика.
+
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.toml      text eol=lf
+*.properties text eol=lf
+*.secret    text eol=lf
+Dockerfile* text eol=lf
+Caddyfile   text eol=lf
+mvnw        text eol=lf
+*.java      text eol=lf
+*.sql       text eol=lf
+
+*.cmd       text eol=crlf
+*.bat       text eol=crlf
+
+*.jar       binary
+*.png       binary
+*.jpg       binary
+*.gz        binary

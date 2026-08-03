@@ -306,11 +306,20 @@
                 <version>${assertj.version}</version>
                 <scope>test</scope>
             </dependency>
+            <!--
+                Область видимости здесь НЕ задаётся намеренно.
+                Раньше стояло test — и это молча ломало веб-модуль: Spring Boot
+                приносит logback-classic транзитивно во время выполнения, но
+                управляемая область test понижала и его, поэтому в fat jar
+                реализации SLF4J не оказывалось вовсе. Приложение писало
+                «No SLF4J providers were found» и дальше работало БЕЗ ЛОГОВ:
+                ни ошибок хранилища, ни событий безопасности в выводе не было.
+                Кому logback нужен только для тестов, тот указывает scope у себя.
+            -->
             <dependency>
                 <groupId>ch.qos.logback</groupId>
                 <artifactId>logback-classic</artifactId>
                 <version>${logback.version}</version>
-                <scope>test</scope>
             </dependency>
         </dependencies>
     </dependencyManagement>
