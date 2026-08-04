@@ -1,7 +1,7 @@
 # KoFAuth — система авторизации KoF Network
 
 Собственная (не AuthMe / не nLogin) production-ready система аутентификации для
-сети Minecraft-серверов **KoF Network**: Velocity + Paper 1.21.8, MySQL, Redis,
+сети Minecraft-серверов **KoF Network**: Velocity + Paper 1.21.8+, MySQL, Redis,
 REST API, Telegram- и Discord-боты, TOTP, личный кабинет.
 
 [![Java](https://img.shields.io/badge/Java-21-orange)](https://openjdk.org/projects/jdk/21/)
@@ -63,7 +63,7 @@ MySQL, Redis, REST API с личным кабинетом. Через 10–20 м
 ./mvnw clean install
 ```
 
-406 тестов: 308 модульных и 98 интеграционных. Последние поднимают настоящие
+413 тестов: 314 модульных и 99 интеграционных. Последние поднимают настоящие
 MySQL 8 и Redis 7 через Testcontainers, поэтому нужен запущенный Docker.
 Без него — `./mvnw clean install -DskipITs`.
 

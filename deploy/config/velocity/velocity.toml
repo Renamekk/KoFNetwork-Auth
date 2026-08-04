@@ -32,7 +32,11 @@ enable-player-address-logging = true
 
 [servers]
 limbo-1 = "limbo:25565"
-lobby-1 = "lobby:25565"
+# Куда игрок попадает после входа. По умолчанию — лобби из этого же compose.
+# Если игровой сервер уже есть и живёт вне Docker, задайте его адрес в .env:
+#   LOBBY_ADDRESS=host.docker.internal:25566
+# и уберите профиль lobby из COMPOSE_PROFILES, чтобы не поднимать лишний.
+lobby-1 = "${CFG_LOBBY_ADDRESS}"
 
 # try обязан указывать на Limbo. Окажись здесь лобби — игрок на мгновение
 # попал бы на боевой сервер до того, как отработает маршрутизация KoFAuth.

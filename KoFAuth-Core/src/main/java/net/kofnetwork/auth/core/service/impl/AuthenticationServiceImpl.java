@@ -352,9 +352,13 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
         Long deviceId = device.map(result -> result.device().id()).orElse(null);
         Instant now = Instant.now();
 
-        return enforceSessionLimit(account, request)
-                .thenCompose(ignored -> sessions.create(account.id(),
-                        sessionTypeFor(request), request.context(), deviceId))
+        // Порядок важен: сначала создаём новую сессию, потом отзываем прежние,
+        // исключая её. В обратном порядке отзыв не может назвать новую сессию —
+        // её ещё нет, — и событие получается «отозваны все», по которому прокси
+        // выбрасывает игрока, только что успешно введшего пароль.
+        return sessions.create(account.id(), sessionTypeFor(request), request.context(), deviceId)
+                .thenCompose(session -> enforceSessionLimit(account, request, session)
+                        .thenApply(ignored -> session))
                 .thenCompose(session -> accounts.updateLastLogin(account.id(), request.context().ip(),
                                 now, request.context().server(), request.context().country(),
                                 request.context().city(), request.context().userAgent())
@@ -379,8 +383,16 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
      *
      * <p>Старые сессии отзываются, а не отвергается новая: игрок, у которого
      * оборвалось соединение, иначе не смог бы зайти до истечения срока старой сессии.
+     *
+     * <p>Только что созданная сессия исключается по имени. Без этого отзыв
+     * объявлялся бы «все сессии аккаунта», и подписчики — прежде всего прокси —
+     * не могли бы отличить прежние соединения от текущего.
+     *
+     * @param current сессия, выданная этому входу
      */
-    private CompletableFuture<Void> enforceSessionLimit(Account account, LoginRequest request) {
+    private CompletableFuture<Void> enforceSessionLimit(Account account,
+                                                        LoginRequest request,
+                                                        Session current) {
         if (sessionTypeFor(request) != SessionType.GAME) {
             return CompletableFuture.completedFuture(null);
         }
@@ -388,7 +400,7 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
         if (max <= 0) {
             return CompletableFuture.completedFuture(null);
         }
-        return sessions.revokeAll(account.id(), null, Session.REASON_LOGOUT_ALL)
+        return sessions.revokeAll(account.id(), current.publicId(), Session.REASON_LOGOUT_ALL)
                 .thenApply(ignored -> null);
     }
 

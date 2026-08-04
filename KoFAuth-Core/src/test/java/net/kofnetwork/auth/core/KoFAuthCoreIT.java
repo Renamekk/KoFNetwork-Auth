@@ -454,6 +454,38 @@ class KoFAuthCoreIT {
     }
 
     @Test
+    void вход_отзывает_прежнюю_сессию_но_не_выданную_этим_же_входом() {
+        RegistrationResult registered = core.registration()
+                .register(registration("Steve", "Korovka42Luna")).join();
+        String previous = registered.session().publicId();
+
+        var invalidations = new java.util.concurrent.CopyOnWriteArrayList<
+                net.kofnetwork.auth.api.event.events.SessionInvalidatedEvent>();
+        try (var subscription = core.events().subscribe(
+                net.kofnetwork.auth.api.event.events.SessionInvalidatedEvent.class,
+                invalidations::add)) {
+
+            AuthResult result = core.authentication()
+                    .login(LoginRequest.of("Steve", "Korovka42Luna", CONTEXT)).join();
+            assertThat(result.isSuccess()).isTrue();
+            String current = result.session().publicId();
+
+            // Прежняя сессия отозвана, новая работает.
+            assertThat(core.sessions().validateByPublicId(previous, CONTEXT.ip()).join()).isEmpty();
+            assertThat(core.sessions().validateByPublicId(current, CONTEXT.ip()).join()).isPresent();
+
+            // И главное — событие об отзыве называет ТОЛЬКО прежнюю сессию.
+            // Пока оно объявляло «отозваны все», прокси выбрасывал с сервера
+            // игрока, который только что успешно ввёл пароль.
+            assertThat(invalidations).isNotEmpty();
+            var event = invalidations.get(invalidations.size() - 1);
+            assertThat(event.affectsAll()).isFalse();
+            assertThat(event.affects(previous)).isTrue();
+            assertThat(event.affects(current)).isFalse();
+        }
+    }
+
+    @Test
     void пара_токенов_кабинета_выдаётся_и_привязывается_к_сессии() throws Exception {
         RegistrationResult registered = core.registration()
                 .register(registration("Steve", "Korovka42Luna")).join();

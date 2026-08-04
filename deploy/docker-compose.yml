@@ -7,11 +7,13 @@
 #  Обычный запуск:  ./install.sh   (создаст .env, соберёт jar, поднимет стек)
 #  Дальше:          ./kofauth.sh start | stop | logs | status | update
 #
-#  Профили:
-#    (без профиля) — mysql, redis, webapi, velocity, limbo, lobby — игровая сеть
-#    bots          — telegram, discord
-#    web           — caddy, HTTPS для личного кабинета
-#    build         — разовая сборка jar, вызывается install.sh, не поднимается
+#  Профили (задаются в COMPOSE_PROFILES в .env):
+#    (без профиля)     — mysql, redis, webapi, velocity, limbo — основа сети
+#    lobby             — игровой сервер «из коробки»; уберите, если он уже свой,
+#                        и укажите его адрес в LOBBY_ADDRESS
+#    telegram, discord — боты по отдельности; bots — оба сразу
+#    web               — caddy, HTTPS для личного кабинета
+#    build             — разовая сборка jar, вызывается install.sh, не поднимается
 # =============================================================================
 
 name: kofauth
@@ -50,6 +52,15 @@ x-kofauth-env: &kofauth-env
   KOFAUTH_MAIL_SMTP_SSL: ${SMTP_SSL:-false}
   KOFAUTH_MAIL_FROM_ADDRESS: ${MAIL_FROM:-noreply@example.com}
   KOFAUTH_MAIL_FROM_NAME: ${MAIL_FROM_NAME:-KoF Network}
+  # Признак «мессенджер подключён» нужен ВСЕМ процессам, а не только ботам:
+  # команды /telegram и /discord живут на прокси, и по этому флагу они решают,
+  # выдавать код привязки или ответить «не подключён». Задать его лишь
+  # контейнерам ботов — значит получить работающих ботов, к которым игрок
+  # не может привязаться.
+  KOFAUTH_TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}
+  KOFAUTH_TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
+  KOFAUTH_DISCORD_ENABLED: ${DISCORD_ENABLED:-false}
+  KOFAUTH_DISCORD_BOT_GUILD_ID: ${DISCORD_GUILD_ID:-}
   # Подробность логов процессов KoFAuth: INFO, DEBUG, WARN.
   # DEBUG включают на время разбора и снимают: он пишет каждое обращение к базе.
   KOFAUTH_LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -95,8 +106,12 @@ services:
     volumes:
       - mysql-data:/var/lib/mysql
     networks: [kofauth]
-    # Порт наружу не публикуется намеренно: база доступна только контейнерам
-    # этой сети. Для консоли есть ./kofauth.sh db
+    ports:
+      # Только на петлевой адрес: из интернета база не видна, но доступна
+      # процессам этой же машины — игровому серверу вне Docker и клиенту
+      # администратора через SSH-туннель. Открыть наружу можно, поставив
+      # MYSQL_BIND=0.0.0.0, но это ровно то, что находят сканеры за часы.
+      - "${MYSQL_BIND:-127.0.0.1}:${MYSQL_PORT:-3306}:3306"
     healthcheck:
       test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_ROOT_PASSWORD\" mysqladmin ping -h 127.0.0.1 -u root --silent"]
       interval: 10s
@@ -115,6 +130,9 @@ services:
     # источник истины в MySQL.
     command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\" --save '' --appendonly no --maxmemory ${REDIS_MAXMEMORY:-256mb} --maxmemory-policy allkeys-lru"]
     networks: [kofauth]
+    ports:
+      # Как и у MySQL — только петлевой адрес.
+      - "${REDIS_BIND:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli -h 127.0.0.1 ping | grep -qx PONG"]
       interval: 10s
@@ -192,13 +210,20 @@ services:
       CFG_FORWARDING_SECRET: ${FORWARDING_SECRET:?нет в .env — запустите ./install.sh}
       CFG_MOTD: ${MOTD:-<#d4af37>KoF Network}
       CFG_MAX_PLAYERS: ${MAX_PLAYERS:-500}
+      CFG_LOBBY_ADDRESS: ${LOBBY_ADDRESS:-lobby:25565}
     volumes:
       - velocity-data:/server
       - ./config/velocity:/config:ro
       - ./artifacts/kofauth-velocity.jar:/plugins/kofauth-velocity.jar:ro
     ports:
-      - "${MINECRAFT_PORT:-25565}:25565/tcp"
+      # MINECRAFT_BIND=127.0.0.1 — сеть видна только с этой машины,
+      # удобно для проверки до публичного запуска.
+      - "${MINECRAFT_BIND:-0.0.0.0}:${MINECRAFT_PORT:-25565}:25565/tcp"
     networks: [kofauth]
+    # Чтобы LOBBY_ADDRESS мог указывать на игровой сервер, работающий
+    # на самой машине, а не в контейнере.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # Консоль прокси: ./kofauth.sh console — там выполняются команды /auth
     stdin_open: true
     tty: true
@@ -222,13 +247,22 @@ services:
       EULA: "TRUE"
       TYPE: PAPER
       VERSION: ${PAPER_VERSION:-1.21.8}
-      PAPER_BUILD: ${PAPER_BUILD:-60}
+      # Номер сборки привязан к версии: пин от 1.21.8 при смене PAPER_VERSION
+      # не существует, и контейнер не поднимется. Поэтому по умолчанию — latest.
+      PAPER_BUILD: ${PAPER_BUILD:-}
       MEMORY: ${HEAP_LIMBO:-768M}
       # Прямые подключения в обход прокси отсекает форвардинг Velocity,
       # он же передаёт настоящий UUID игрока.
       ONLINE_MODE: "FALSE"
       ENFORCE_SECURE_PROFILE: "FALSE"
       PAPER_VELOCITY_SECRET: ${FORWARDING_SECRET:?}
+      # Форвардинг Velocity включается ТОЛЬКО правкой paper-global.yml.
+      # PAPER_VELOCITY_SECRET сам по себе не включает его и даже не подставляет
+      # секрет: без этого патча прокси отключает игрока с «Your server did not
+      # send a forwarding request to the proxy».
+      PATCH_DEFINITIONS: /config-patch
+      REPLACE_ENV_VARIABLE_PREFIX: CFG_
+      CFG_FORWARDING_SECRET: ${FORWARDING_SECRET:?}
       ENABLE_RCON: "FALSE"
       ENABLE_QUERY: "FALSE"
       SERVER_PORT: "25565"
@@ -244,6 +278,7 @@ services:
     volumes:
       - limbo-data:/data
       - ./artifacts/kofauth-paper.jar:/plugins/kofauth-paper.jar:ro
+      - ./config/paper-patch:/config-patch:ro
     networks: [kofauth]
     healthcheck:
       test: ["CMD-SHELL", "mc-health && grep -Fq 'Режим работы: LIMBO' /data/logs/latest.log && grep -Fq 'KoFAuth запущен' /data/logs/latest.log && ! grep -Fq 'KoFAuth не запустился' /data/logs/latest.log"]
@@ -254,8 +289,12 @@ services:
     stop_grace_period: 60s
     logging: *logging
 
+  # Игровой сервер «из коробки». Профиль lobby включён по умолчанию
+  # (install.sh пишет его в COMPOSE_PROFILES). Если сервер уже есть — уберите
+  # профиль и укажите его адрес в LOBBY_ADDRESS.
   lobby:
     image: itzg/minecraft-server:2026.5.4-java21
+    profiles: [lobby]
     restart: unless-stopped
     depends_on:
       limbo: {condition: service_healthy}
@@ -266,11 +305,20 @@ services:
       EULA: "TRUE"
       TYPE: PAPER
       VERSION: ${PAPER_VERSION:-1.21.8}
-      PAPER_BUILD: ${PAPER_BUILD:-60}
+      # Номер сборки привязан к версии: пин от 1.21.8 при смене PAPER_VERSION
+      # не существует, и контейнер не поднимется. Поэтому по умолчанию — latest.
+      PAPER_BUILD: ${PAPER_BUILD:-}
       MEMORY: ${HEAP_LOBBY:-2G}
       ONLINE_MODE: "FALSE"
       ENFORCE_SECURE_PROFILE: "FALSE"
       PAPER_VELOCITY_SECRET: ${FORWARDING_SECRET:?}
+      # Форвардинг Velocity включается ТОЛЬКО правкой paper-global.yml.
+      # PAPER_VELOCITY_SECRET сам по себе не включает его и даже не подставляет
+      # секрет: без этого патча прокси отключает игрока с «Your server did not
+      # send a forwarding request to the proxy».
+      PATCH_DEFINITIONS: /config-patch
+      REPLACE_ENV_VARIABLE_PREFIX: CFG_
+      CFG_FORWARDING_SECRET: ${FORWARDING_SECRET:?}
       ENABLE_RCON: "TRUE"
       RCON_PASSWORD: ${RCON_PASSWORD:?нет в .env — запустите ./install.sh}
       ENABLE_QUERY: "FALSE"
@@ -285,6 +333,7 @@ services:
     volumes:
       - lobby-data:/data
       - ./artifacts/kofauth-paper.jar:/plugins/kofauth-paper.jar:ro
+      - ./config/paper-patch:/config-patch:ro
     networks: [kofauth]
     healthcheck:
       test: ["CMD-SHELL", "mc-health && grep -Fq 'Режим работы: BACKEND' /data/logs/latest.log && grep -Fq 'KoFAuth запущен' /data/logs/latest.log && ! grep -Fq 'KoFAuth не запустился' /data/logs/latest.log"]

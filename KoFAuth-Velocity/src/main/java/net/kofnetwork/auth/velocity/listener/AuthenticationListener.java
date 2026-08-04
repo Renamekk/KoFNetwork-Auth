@@ -85,8 +85,18 @@ public final class AuthenticationListener {
     /**
      * Определяет исходное состояние игрока.
      *
-     * <p>Выполняется после создания профиля, но до подключения к серверу, поэтому
-     * {@link ServerPreConnectEvent} уже увидит выставленное состояние.
+     * <p><b>Ожидание здесь обязательно.</b> Velocity подключает игрока к серверу
+     * только после того, как все обработчики этого события завершились, — но
+     * «завершился» для асинхронной цепочки означает «вернул управление», а не
+     * «дописал состояние». Раньше метод отдавал управление сразу, и следующий
+     * за ним {@link ServerPreConnectEvent} успевал прочитать состояние по
+     * умолчанию — {@code CONNECTING}. Для игрока с действующей сессией это
+     * означало отправку в Limbo вместо игрового сервера при каждом
+     * переподключении.
+     *
+     * <p>Событие выполняется вне сетевого потока, поэтому блокировка допустима:
+     * тормозится вход одного игрока, а не работа прокси. Так же поступает
+     * {@link #onPreLogin(PreLoginEvent)}.
      */
     @Subscribe(order = PostOrder.EARLY)
     public void onPostLogin(PostLoginEvent event) {
@@ -94,25 +104,28 @@ public final class AuthenticationListener {
         UUID uuid = player.getUniqueId();
         IpAddress ip = IpAddress.of(player.getRemoteAddress().getAddress());
 
-        core.sessions().validate(uuid, ip)
-                .thenCompose(session -> {
-                    if (session.isPresent()) {
-                        // Действующая сессия: игрок продолжает с того же места,
-                        // повторный ввод пароля после разрыва соединения раздражает
-                        // и ничего не добавляет к безопасности.
-                        return core.sessions().setState(uuid, AuthState.AUTHENTICATED);
-                    }
-                    return core.authentication().findAccount(player.getUsername())
-                            .thenCompose(account -> core.sessions().setState(uuid,
-                                    account.isPresent()
-                                            ? AuthState.AWAITING_LOGIN
-                                            : AuthState.AWAITING_REGISTER));
-                })
-                .exceptionally(e -> {
-                    logger.error("Не удалось определить состояние игрока {}",
-                            player.getUsername(), e);
-                    return false;
-                });
+        try {
+            core.sessions().validate(uuid, ip)
+                    .thenCompose(session -> {
+                        if (session.isPresent()) {
+                            // Действующая сессия: игрок продолжает с того же места,
+                            // повторный ввод пароля после разрыва соединения раздражает
+                            // и ничего не добавляет к безопасности.
+                            return core.sessions().setState(uuid, AuthState.AUTHENTICATED);
+                        }
+                        return core.authentication().findAccount(player.getUsername())
+                                .thenCompose(account -> core.sessions().setState(uuid,
+                                        account.isPresent()
+                                                ? AuthState.AWAITING_LOGIN
+                                                : AuthState.AWAITING_REGISTER));
+                    })
+                    .join();
+        } catch (RuntimeException e) {
+            // Состояние не определилось — игрок останется в CONNECTING и попадёт
+            // в Limbo. Это безопасный исход: пустит его только пароль.
+            logger.error("Не удалось определить состояние игрока {}",
+                    player.getUsername(), e);
+        }
     }
 
     /**
@@ -126,11 +139,28 @@ public final class AuthenticationListener {
         Player player = event.getPlayer();
         AuthState state = core.sessions().getState(player.getUniqueId()).join();
 
+        String target = event.getOriginalServer().getServerInfo().getName();
+
         if (!state.requiresLimbo()) {
+            // Игрок с действующей сессией не должен попадать в Limbo. Сам он туда
+            // и не просится: в velocity.toml `try` обязан указывать на Limbo,
+            // поэтому первое подключение любого игрока идёт именно туда. Без этой
+            // ветки вернувшийся игрок оставался в Limbo навсегда — перевести его
+            // дальше было некому, потому что /login он не выполнял.
+            if (router.isLimbo(target)) {
+                Optional<RegisteredServer> lobby = router.selectLobby();
+                if (lobby.isPresent()) {
+                    event.setResult(ServerPreConnectEvent.ServerResult.allowed(lobby.get()));
+                    return;
+                }
+                // Лобби недоступно — пусть подождёт в Limbo. Он аутентифицирован,
+                // и оставить его там безопаснее, чем отключить.
+                logger.warn("Лобби недоступно, вошедший игрок {} остаётся в Limbo",
+                        player.getUsername());
+            }
             return;
         }
 
-        String target = event.getOriginalServer().getServerInfo().getName();
         if (router.isLimbo(target)) {
             return;
         }

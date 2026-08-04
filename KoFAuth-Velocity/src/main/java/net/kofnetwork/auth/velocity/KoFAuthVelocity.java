@@ -14,6 +14,7 @@ import net.kofnetwork.auth.api.config.ConfigFile;
 import net.kofnetwork.auth.api.event.events.RemoteEvent;
 import net.kofnetwork.auth.api.event.events.SessionInvalidatedEvent;
 import net.kofnetwork.auth.api.model.AuthState;
+import net.kofnetwork.auth.api.model.IpAddress;
 import net.kofnetwork.auth.core.KoFAuthCore;
 import net.kofnetwork.auth.velocity.command.AuthAdminCommand;
 import net.kofnetwork.auth.velocity.command.EmailCommand;
@@ -27,7 +28,11 @@ import org.slf4j.Logger;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 /**
  * Плагин Velocity: гейт аутентификации сети.
@@ -148,7 +153,7 @@ public final class KoFAuthVelocity {
         // Локальные события того же типа — от этого же узла.
         core.events().subscribe(SessionInvalidatedEvent.class, event -> {
             if (event.accountId() != null) {
-                kickByAccount(event.accountId(), event.reason());
+                kickByAccount(event.accountId(), event.reason(), event::affects);
             }
         });
     }
@@ -158,26 +163,64 @@ public final class KoFAuthVelocity {
         if (accountId == null) {
             return;
         }
-        kickByAccount(accountId, event.attribute("reason", "SESSION_REVOKED"));
+        kickByAccount(accountId, event.attribute("reason", "SESSION_REVOKED"),
+                revokedSessions(event.attribute("sessions", ""),
+                        event.booleanAttribute("affectsAll")));
     }
 
     /**
-     * Выкидывает игроков отозванного аккаунта обратно в Limbo.
+     * Разбирает перечень отозванных сессий из удалённого события.
+     *
+     * <p>По сети список едет строкой через запятую — в плоском {@code RemoteEvent}
+     * массива нет. Пустой список вместе с {@code affectsAll = false} означает
+     * «не затронута ни одна»: трактовать его как «все» значило бы выбрасывать
+     * игроков по событию, которое их не касается.
+     */
+    static Predicate<String> revokedSessions(String sessionsAttribute, boolean affectsAll) {
+        if (affectsAll) {
+            return publicId -> true;
+        }
+        Set<String> revoked = Arrays.stream(sessionsAttribute.split(","))
+                .map(String::trim)
+                .filter(id -> !id.isEmpty())
+                .collect(Collectors.toSet());
+        return revoked::contains;
+    }
+
+    /**
+     * Выкидывает игроков, чья сессия отозвана, обратно в Limbo.
      *
      * <p>Сопоставление идёт через проверку сессии: держать на прокси карту
      * «accountId → игрок» значило бы дублировать состояние, которое уже есть
      * в Redis, и рассинхронизироваться с ним при каждом переподключении.
+     *
+     * <p><b>Сверка с конкретной сессией обязательна.</b> Раньше отключались все
+     * игроки аккаунта — и это ломало обычный вход. При {@code max-concurrent: 1}
+     * успешный {@code /login} отзывает прежнюю сессию, событие об этом приходило
+     * сюда и выбрасывало того самого игрока, который только что ввёл пароль,
+     * с сообщением «Ваша сессия завершена. Войдите заново». Событие при этом
+     * честно перечисляло только старые сессии; их просто никто не читал.
+     *
+     * @param affects принимает публичный идентификатор сессии и отвечает,
+     *                затронута ли она отзывом
      */
-    private void kickByAccount(long accountId, String reason) {
+    private void kickByAccount(long accountId, String reason, Predicate<String> affects) {
         for (Player player : proxy.getAllPlayers()) {
             core.authentication().findAccount(player.getUsername()).thenAccept(account -> {
                 if (account.isEmpty() || account.get().id() != accountId) {
                     return;
                 }
-                core.sessions().setState(player.getUniqueId(), AuthState.BLOCKED);
-                player.disconnect(messages.kick(
-                        "PASSWORD_CHANGED".equals(reason) ? "password-changed" : "session-revoked",
-                        "<yellow>Ваша сессия завершена. Войдите заново."));
+                IpAddress ip = IpAddress.of(player.getRemoteAddress().getAddress());
+                core.sessions().validate(player.getUniqueId(), ip).thenAccept(session -> {
+                    if (session.isPresent() && !affects.test(session.get().publicId())) {
+                        // Сессия жива, и отзыв её не называет — игрок остаётся.
+                        return;
+                    }
+                    core.sessions().setState(player.getUniqueId(), AuthState.BLOCKED);
+                    player.disconnect(messages.kick(
+                            "PASSWORD_CHANGED".equals(reason) ? "password-changed" : "session-revoked",
+                            "<yellow>Ваша сессия завершена. Войдите заново."));
+                });
             });
         }
     }

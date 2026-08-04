@@ -431,7 +431,65 @@ unzip -p artifacts/kofauth-velocity.jar velocity-plugin.json
 
 ---
 
-## 14. Добавить ещё один игровой сервер
+## 14. Подключить сервер, который уже работает
+
+Если игровой сервер с миром и плагинами уже есть, поднимать лобби «из коробки»
+незачем — KoFAuth встаёт перед ним.
+
+**1. Убрать встроенное лобби и указать адрес своего сервера** в `.env`:
+
+```bash
+COMPOSE_PROFILES=telegram,discord    # без lobby
+LOBBY_ADDRESS=host.docker.internal:25566
+```
+
+`host.docker.internal` — это машина, на которой работает Docker. Если сервер
+на другой машине, укажите её адрес.
+
+**2. Переставить свой сервер за прокси.** В `server.properties`:
+
+```properties
+server-port=25566
+online-mode=false
+enforce-secure-profile=false
+```
+
+`online-mode=false` обязателен: личность игрока теперь подтверждает форвардинг
+Velocity, а не Mojang. Сервер при этом **не** становится открытым — наоборот,
+попасть на него можно только через прокси, и только с корректной подписью.
+
+**3. Включить форвардинг** в `config/paper-global.yml`:
+
+```yaml
+proxies:
+  velocity:
+    enabled: true
+    online-mode: false
+    secret: '<FORWARDING_SECRET из .env>'
+```
+
+**`enabled: true` — не формальность.** Без него Velocity отправляет бэкенду
+запрос `velocity:player_info`, не получает ответа и отключает игрока с
+«Your server did not send a forwarding request to the proxy». Сервер при этом
+стартует нормально и в логах пусто — видно только со стороны игрока.
+
+`online-mode` под `velocity` должен совпадать с `online-mode` прокси: там
+`false`, значит и здесь `false`, иначе UUID разойдутся и игрок потеряет
+инвентарь и права.
+
+**4. Положить плагин.** `artifacts/kofauth-paper.jar` в `plugins/`, а в
+`plugins/KoFAuth/paper.yml` — `mode: BACKEND`. В `database.yml` и `security.yml`
+укажите тот же MySQL, Redis и ключи, что в `.env`. Плагин на бэкенде проверяет
+сессию: это вторая линия обороны на случай, если кто-то достучится до порта
+сервера напрямую.
+
+**5. Версии.** Limbo, лобби и клиент обязаны быть одной версии Minecraft.
+Задайте `PAPER_VERSION` в `.env` под свой сервер — игрок 1.21.11 не зайдёт
+на Limbo 1.21.8.
+
+---
+
+## 15. Добавить ещё один игровой сервер
 
 Один и тот же jar Paper работает и Limbo, и игровым сервером — роль задаёт
 переменная `KOFAUTH_PAPER_MODE`. Добавьте службу в `docker-compose.yml`,
@@ -483,7 +541,7 @@ try = ["limbo-1"]
 
 ---
 
-## 15. Куда смотреть дальше
+## 16. Куда смотреть дальше
 
 | Документ | О чём |
 |---|---|

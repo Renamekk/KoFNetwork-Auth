@@ -200,18 +200,32 @@ fill_secret FORWARDING_SECRET   "$(random_hex 24)"
 
 profiles="$(get_env COMPOSE_PROFILES)"
 add_profile() { case ",$profiles," in *",$1,"*) ;; *) profiles="${profiles:+$profiles,}$1" ;; esac; }
+# Профиль lobby приходит из .env.example при первой установке. Обратно его
+# здесь не добавляют: администратор мог убрать его осознанно, подключив свой
+# игровой сервер, и возврат поднял бы второй, на который никто не ходит.
+has_profile() { case ",$profiles," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
 if [ "$ASSUME_YES" = 0 ] && [ -t 0 ]; then
     printf '\n  %sНеобязательное — можно пропустить (Enter) и настроить позже в .env%s\n' "$BOLD" "$OFF"
 
     if [ -z "$(get_env TELEGRAM_BOT_TOKEN)" ]; then
         t=$(ask 'Токен Telegram-бота от @BotFather' '')
-        if [ -n "$t" ]; then set_env TELEGRAM_BOT_TOKEN "$t"; add_profile telegram; ok "Telegram включён"; fi
+        if [ -n "$t" ]; then
+            set_env TELEGRAM_BOT_TOKEN "$t"
+            set_env TELEGRAM_BOT_USERNAME "$(ask 'Имя бота без собачки' '')"
+            add_profile telegram
+            ok "Telegram включён"
+        fi
     fi
 
     if [ -z "$(get_env DISCORD_BOT_TOKEN)" ]; then
         d=$(ask 'Токен Discord-бота' '')
-        if [ -n "$d" ]; then set_env DISCORD_BOT_TOKEN "$d"; add_profile discord; ok "Discord включён"; fi
+        if [ -n "$d" ]; then
+            set_env DISCORD_BOT_TOKEN "$d"
+            set_env DISCORD_GUILD_ID "$(ask 'ID сервера Discord (пусто — команды глобально)' '')"
+            add_profile discord
+            ok "Discord включён"
+        fi
     fi
 
     if [ -z "$(get_env DOMAIN)" ]; then
@@ -232,10 +246,18 @@ if [ "$ASSUME_YES" = 0 ] && [ -t 0 ]; then
 fi
 
 # Бот без токена завершится с понятной записью в логе, поэтому профиль
-# включаем строго по факту наличия токена.
-if [ -n "$(get_env TELEGRAM_BOT_TOKEN)" ]; then add_profile telegram; fi
-if [ -n "$(get_env DISCORD_BOT_TOKEN)" ];  then add_profile discord;  fi
-if [ -n "$(get_env DOMAIN)" ];             then add_profile web;      fi
+# включаем строго по факту наличия токена. Вместе с профилем поднимается флаг
+# для остальных процессов: без него команда привязки на прокси отвечает
+# «не подключён», и бот оказывается недостижим для игрока.
+if [ -n "$(get_env TELEGRAM_BOT_TOKEN)" ]; then
+    add_profile telegram
+    set_env TELEGRAM_ENABLED true
+fi
+if [ -n "$(get_env DISCORD_BOT_TOKEN)" ]; then
+    add_profile discord
+    set_env DISCORD_ENABLED true
+fi
+if [ -n "$(get_env DOMAIN)" ]; then add_profile web; fi
 set_env COMPOSE_PROFILES "$profiles"
 if [ -n "$profiles" ]; then ok "Профили: $profiles"; fi
 
@@ -298,7 +320,9 @@ wait_healthy() {
 
 failed=0
 printf '  '
-for s in mysql redis webapi velocity limbo lobby; do
+services="mysql redis webapi velocity limbo"
+if has_profile lobby; then services="$services lobby"; fi
+for s in $services; do
     wait_healthy "$s" || failed=1
 done
 

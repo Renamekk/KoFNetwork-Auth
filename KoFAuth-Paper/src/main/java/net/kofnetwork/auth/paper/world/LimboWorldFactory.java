@@ -3,8 +3,10 @@ package net.kofnetwork.auth.paper.world;
 import org.bukkit.Difficulty;
 import org.bukkit.GameRule;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.WorldCreator;
+import org.bukkit.block.Block;
 import org.bukkit.generator.ChunkGenerator;
 import org.jetbrains.annotations.NotNull;
 
@@ -101,6 +103,37 @@ public final class LimboWorldFactory {
         applyRules(world, fixedTime, noWeather);
         logger.info("Мир Limbo '" + name + "' готов");
         return world;
+    }
+
+    /**
+     * Кладёт площадку под точкой появления и делает её точкой респавна мира.
+     *
+     * <p>Мир пустой, и без площадки игрок просто падает в пустоту. Пока он не
+     * аутентифицирован, падение гасит защита — но у неё есть законные исключения
+     * (вошедший игрок, ожидающий перевода на игровой сервер), и для них падение
+     * заканчивается смертью и экраном возрождения. Пол снимает этот класс отказов
+     * целиком, а не для отдельных состояний.
+     *
+     * <p>Барьер, а не стекло: он невидим, неразрушим и не отбрасывает тени —
+     * в комнате ожидания видеть под ногами нечего.
+     */
+    public static void ensureFloor(@NotNull Location spawn, int radius) {
+        World world = spawn.getWorld();
+        if (world == null || radius < 0) {
+            return;
+        }
+        int floorY = spawn.getBlockY() - 1;
+        for (int x = -radius; x <= radius; x++) {
+            for (int z = -radius; z <= radius; z++) {
+                Block block = world.getBlockAt(spawn.getBlockX() + x, floorY, spawn.getBlockZ() + z);
+                if (block.getType() == Material.AIR) {
+                    // Без обновления физики: соседних блоков нет, а пересчёт
+                    // освещения на каждый блок при старте не нужен.
+                    block.setType(Material.BARRIER, false);
+                }
+            }
+        }
+        world.setSpawnLocation(spawn);
     }
 
     /** Замораживает мир: ничего не растёт, не тикает и не спавнится. */

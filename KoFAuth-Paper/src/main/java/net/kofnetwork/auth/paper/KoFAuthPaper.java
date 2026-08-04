@@ -105,6 +105,8 @@ public final class KoFAuthPaper extends JavaPlugin implements Listener {
 
         limboWorld = LimboWorldFactory.loadOrCreate(worldName, fixedTime, noWeather,
                 getLogger());
+        LimboWorldFactory.ensureFloor(spawnLocation(),
+                core.config().getInt(ConfigFile.PAPER, "limbo.spawn.platform-radius", 3));
 
         protection = new LimboProtectionListener(core, this);
         getServer().getPluginManager().registerEvents(protection, this);

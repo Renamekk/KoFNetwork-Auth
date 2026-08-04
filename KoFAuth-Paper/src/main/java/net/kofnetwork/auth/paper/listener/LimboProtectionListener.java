@@ -244,7 +244,7 @@ public final class LimboProtectionListener implements Listener {
             if (event.getFrom().getBlockX() != event.getTo().getBlockX()
                     || event.getFrom().getBlockZ() != event.getTo().getBlockZ()
                     || event.getFrom().getBlockY() != event.getTo().getBlockY()) {
-                event.setTo(event.getFrom());
+                event.setTo(keepingView(event.getFrom(), event.getTo()));
             }
             return;
         }
@@ -255,8 +255,24 @@ public final class LimboProtectionListener implements Listener {
         }
         double radius = config.getDouble(ConfigFile.PAPER, "limbo.protection.movement-radius", 5.0);
         if (event.getTo().distanceSquared(anchor) > radius * radius) {
-            event.setTo(anchor.clone());
+            event.setTo(keepingView(anchor, event.getTo()));
         }
+    }
+
+    /**
+     * Позиция из {@code target}, но направление взгляда — из {@code requested}.
+     *
+     * <p>Иначе возврат на точку сбрасывал бы и поворот головы: PlayerMoveEvent
+     * приходит и на чистый поворот мыши, и подстановка старой локации целиком
+     * возвращала камеру назад несколько раз в секунду. Со стороны игрока это
+     * выглядит не как ограничение зоны, а как намертво зависший клиент —
+     * жалоба «застрял, не могу ни двигаться, ни вертеть камерой» именно про это.
+     */
+    static Location keepingView(Location target, Location requested) {
+        Location corrected = target.clone();
+        corrected.setYaw(requested.getYaw());
+        corrected.setPitch(requested.getPitch());
+        return corrected;
     }
 
     /** Телепортация неаутентифицированного игрока за пределы Limbo запрещена. */
