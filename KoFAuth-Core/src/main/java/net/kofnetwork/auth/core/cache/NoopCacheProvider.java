@@ -1,5 +1,6 @@
 package net.kofnetwork.auth.core.cache;
 
+import net.kofnetwork.auth.api.exception.CacheUnavailableException;
 import org.jetbrains.annotations.NotNull;
 
 import java.time.Duration;
@@ -140,6 +141,65 @@ public class NoopCacheProvider implements CacheProvider {
     @Override
     public boolean isAvailable() {
         return false;
+    }
+
+    @Override
+    public boolean isDistributed() {
+        return false;
+    }
+
+    /**
+     * Строгие операции отвергаются: заглушка ничего не хранит.
+     *
+     * <p>Именно это отличает её от {@link LocalCacheProvider}. Заглушка подставляется
+     * там, где хранилища нет вовсе, и делать вид, что состояние входа записано, ей
+     * нельзя: игрок с «записанным» состоянием, которого на самом деле нет, — это
+     * либо вечное ожидание пароля, либо пропуск дальше без него.
+     */
+    @Override
+    public @NotNull Critical critical() {
+        return new Critical() {
+
+            @Override
+            public @NotNull CompletableFuture<Optional<String>> get(@NotNull String key) {
+                return failed();
+            }
+
+            @Override
+            public @NotNull CompletableFuture<Void> set(@NotNull String key,
+                                                        @NotNull String value,
+                                                        @NotNull Duration ttl) {
+                return failed();
+            }
+
+            @Override
+            public @NotNull CompletableFuture<Boolean> delete(@NotNull String key) {
+                return failed();
+            }
+
+            @Override
+            public @NotNull CompletableFuture<Map<String, String>> getHash(@NotNull String key) {
+                return failed();
+            }
+
+            @Override
+            public @NotNull CompletableFuture<Void> setHash(@NotNull String key,
+                                                            @NotNull Map<String, String> values,
+                                                            @NotNull Duration ttl) {
+                return failed();
+            }
+
+            @Override
+            public @NotNull CompletableFuture<Long> incrementSlidingWindow(@NotNull String key,
+                                                                            @NotNull Duration window) {
+                return failed();
+            }
+
+            private <T> CompletableFuture<T> failed() {
+                return CompletableFuture.failedFuture(new CacheUnavailableException(
+                        "Хранилище состояния не настроено"));
+            }
+        };
     }
 
     @Override

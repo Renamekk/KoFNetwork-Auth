@@ -10,6 +10,7 @@ import net.kofnetwork.auth.paper.captcha.ChatCaptchaRenderer;
 import net.kofnetwork.auth.paper.captcha.GuiCaptchaRenderer;
 import net.kofnetwork.auth.paper.command.CaptchaCommand;
 import net.kofnetwork.auth.paper.listener.LimboProtectionListener;
+import net.kofnetwork.auth.paper.listener.LockdownListener;
 import net.kofnetwork.auth.paper.world.LimboWorldFactory;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.minimessage.MiniMessage;
@@ -65,10 +66,7 @@ public final class KoFAuthPaper extends JavaPlugin implements Listener {
                     ? (KoFAuthCore) KoFAuthProvider.get()
                     : startOwnCore();
         } catch (RuntimeException e) {
-            // Сервер без работающей аутентификации опаснее выключенного:
-            // он пустит кого угодно под чужим ником.
-            getLogger().severe("KoFAuth не запустился, плагин выключается: " + e.getMessage());
-            getServer().getPluginManager().disablePlugin(this);
+            lockdown("KoFAuth не запустился: " + e.getMessage(), e);
             return;
         }
 
@@ -80,8 +78,83 @@ public final class KoFAuthPaper extends JavaPlugin implements Listener {
         }
 
         getServer().getPluginManager().registerEvents(this, this);
+        startReadinessWatch();
         getLogger().info("KoFAuth запущен");
     }
+
+    /**
+     * Закрывает сервер, когда аутентификация не работает.
+     *
+     * <p><b>Почему одного {@code disablePlugin} мало.</b> Прежде отказ запуска
+     * выключал плагин — и на этом всё. Сервер оставался работать: слушал порт,
+     * принимал подключения и никак их не проверял. Прямое подключение в обход
+     * прокси попадало на живой игровой мир под любым ником. Выключенный плагин
+     * защиты не защищает.
+     *
+     * <p>Порядок здесь важен. Сначала регистрируется отсечка, отвергающая любые
+     * новые подключения, затем отключаются уже подключённые, и только потом
+     * останавливается сервер: между решением и фактической остановкой проходят
+     * секунды, и в это окно иначе успевал бы зайти кто угодно.
+     *
+     * <p>Остановку можно отключить настройкой {@code fail-closed.shutdown} — тогда
+     * сервер останется поднятым, но в блокировке. Это уместно лишь там, где рядом
+     * стоит внешний надзор, который увидит отказ и вмешается.
+     */
+    private void lockdown(String reason, Throwable cause) {
+        getLogger().severe("Сервер переводится в блокировку. " + reason);
+        if (cause != null) {
+            getLogger().severe(cause.toString());
+        }
+
+        LockdownListener guard = new LockdownListener(
+                "<red>Сервер авторизации недоступен. Зайдите позже.");
+        getServer().getPluginManager().registerEvents(guard, this);
+        getServer().getScheduler().runTask(this,
+                () -> guard.kickEveryone(getServer().getOnlinePlayers()));
+
+        boolean shutdown = core == null
+                || core.config().getBoolean(ConfigFile.PAPER, "fail-closed.shutdown", true);
+        if (shutdown) {
+            getLogger().severe("Останавливаю сервер: работать без аутентификации нельзя.");
+            getServer().getScheduler().runTask(this, () -> getServer().shutdown());
+        }
+    }
+
+    /**
+     * Следит, что аутентификация продолжает работать.
+     *
+     * <p>Отказ базы или хранилища состояния уже после запуска ничем не лучше отказа
+     * при старте: сервер так же перестаёт отличать вошедшего игрока от невошедшего.
+     * Порог в несколько проверок подряд нужен, чтобы секундная помеха не роняла
+     * сервер, на котором играют люди.
+     */
+    private void startReadinessWatch() {
+        if (!core.config().getBoolean(ConfigFile.PAPER, "fail-closed.watch-readiness", true)) {
+            return;
+        }
+        long ticks = Math.max(100L, core.config()
+                .getDuration(ConfigFile.PAPER, "fail-closed.check-interval", Duration.ofSeconds(15))
+                .toSeconds() * 20L);
+        int threshold = Math.max(1, core.config()
+                .getInt(ConfigFile.PAPER, "fail-closed.failures-before-lockdown", 4));
+
+        getServer().getScheduler().runTaskTimerAsynchronously(this, () -> {
+            if (core.isReady()) {
+                readinessFailures.set(0);
+                return;
+            }
+            int failures = readinessFailures.incrementAndGet();
+            getLogger().warning("KoFAuth не готов (" + core.readinessDetail()
+                    + "), подряд отказов: " + failures + " из " + threshold);
+            if (failures >= threshold) {
+                lockdown("зависимости недоступны: " + core.readinessDetail(), null);
+            }
+        }, ticks, ticks);
+    }
+
+    /** Сколько проверок готовности подряд не прошло. */
+    private final java.util.concurrent.atomic.AtomicInteger readinessFailures =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     private KoFAuthCore startOwnCore() {
         ownsCore = true;

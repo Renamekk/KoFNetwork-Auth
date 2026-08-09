@@ -9,7 +9,8 @@ import jakarta.validation.constraints.Size;
 import net.kofnetwork.auth.api.config.ConfigFile;
 import net.kofnetwork.auth.api.dto.AuthContext;
 import net.kofnetwork.auth.api.model.Account;
-import net.kofnetwork.auth.api.model.TokenType;
+import net.kofnetwork.auth.api.model.BotPlatform;
+import net.kofnetwork.auth.api.service.LoginApprovalService;
 import net.kofnetwork.auth.api.result.OperationResult;
 import net.kofnetwork.auth.core.KoFAuthCore;
 import net.kofnetwork.auth.core.security.TokenGenerator;
@@ -77,8 +78,22 @@ public class BotController {
                                long externalId) {
     }
 
-    public record ApprovalBody(@NotBlank @Size(max = 128) String token,
+    /**
+     * Нажатие кнопки.
+     *
+     * <p>Идентификатор запроса сам по себе ничего не открывает: сервер сверяет, что
+     * нажал тот, кому кнопка адресована. Раньше здесь ехал предъявительский токен —
+     * кто его прочитал, тот и входил.
+     */
+    public record ApprovalBody(@NotBlank @Size(max = 16) String platform,
+                               long externalId,
+                               @NotBlank @Size(max = 64) String approvalId,
                                boolean approved) {
+    }
+
+    /** Подтверждение прочитанного ботом. */
+    public record AckBody(@NotBlank @Size(max = 16) String platform,
+                          long cursor) {
     }
 
     public record SecurityBody(@NotBlank @Size(max = 16) String platform,
@@ -240,35 +255,80 @@ public class BotController {
 
     @PostMapping("/approval")
     @Operation(summary = "Подтвердить или отклонить вход",
-            description = "Токен одноразовый: повторное нажатие кнопки не создаст "
-                    + "вторую сессию.")
+            description = "Решение принимается ровно один раз: повторное нажатие "
+                    + "вернёт уже записанный исход, а не создаст вторую сессию. "
+                    + "Нажатие принимается только от того, кому адресована кнопка.")
     public ResponseEntity<?> approval(@Valid @RequestBody ApprovalBody body,
                                       HttpServletRequest request) {
         return guarded(request, () -> {
-            var result = core.authentication()
-                    .completeApproval(body.token(), body.approved(), AuthContext.telegram())
+            BotPlatform platform = BotPlatform.parse(body.platform())
+                    .orElseThrow(() -> new IllegalArgumentException(
+                            "Неизвестная платформа: " + body.platform()));
+
+            LoginApprovalService.Decision decision = core.approvals()
+                    .decide(body.approvalId(), platform, body.externalId(), body.approved())
                     .join();
-            return ResponseEntity.ok(Map.of(
-                    "ok", result.isSuccess(),
-                    "type", result.type().name()));
+
+            HttpStatus status = switch (decision.result()) {
+                case APPLIED -> HttpStatus.OK;
+                case NOT_FOUND -> HttpStatus.NOT_FOUND;
+                // Нажал не тот, кому кнопка адресована. Отдельный код нужен, чтобы бот
+                // ответил человеку по существу, а не «что-то пошло не так».
+                case FOREIGN -> HttpStatus.FORBIDDEN;
+                case EXPIRED, ALREADY_DECIDED -> HttpStatus.CONFLICT;
+            };
+
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("ok", decision.isApplied());
+            payload.put("result", decision.result().name());
+            payload.put("status", decision.status().name());
+            payload.put("username", decision.username());
+            return ResponseEntity.status(status).body(payload);
         });
     }
 
-    @PostMapping("/sendcode")
-    @Operation(summary = "Выдать код подтверждения входа для ручного ввода",
-            description = "Запасной путь, когда сообщение с кнопками не дошло. "
-                    + "Ранее выданные коды гасятся: несколько действующих "
-                    + "одновременно расширяют окно, в котором принимается любой.")
-    public ResponseEntity<?> sendCode(@Valid @RequestBody IdentityBody body,
-                                      HttpServletRequest request) {
-        return withAccount(request, body, (platform, account) -> {
-            var issued = core.tokens().revokeAllByType(account.id(), TokenType.LOGIN_APPROVAL)
-                    .thenCompose(ignored -> core.tokens()
-                            .issue(account.id(), TokenType.LOGIN_APPROVAL, null, null))
-                    .join();
+    @GetMapping("/events")
+    @Operation(summary = "Сообщения боту из долговечной очереди",
+            description = "Заменяет подписку ботов на Redis. Курсор хранится на сервере, "
+                    + "поэтому перезапуск бота ничего не теряет.")
+    public ResponseEntity<?> events(@RequestParam String platform,
+                                    @RequestParam(defaultValue = "100") int limit,
+                                    HttpServletRequest request) {
+        return guarded(request, () -> {
+            BotPlatform kind = BotPlatform.parse(platform)
+                    .orElseThrow(() -> new IllegalArgumentException(
+                            "Неизвестная платформа: " + platform));
+
+            long cursor = core.botOutbox().cursor(kind).join();
+            var messages = core.botOutbox()
+                    .readAfter(kind, cursor, bounded(limit, 500), Instant.now()).join();
+
             return ResponseEntity.ok(Map.of(
-                    "code", issued.value(),
-                    "expiresInSeconds", TokenType.LOGIN_APPROVAL.defaultLifetime().toSeconds()));
+                    "cursor", cursor,
+                    "messages", messages.stream()
+                            .map(message -> mapOf(
+                                    "id", message.id(),
+                                    "kind", message.kind().name(),
+                                    "recipientId", message.recipientId(),
+                                    "chatId", message.chatId(),
+                                    "createdAt", message.createdAt().toString(),
+                                    "expiresAt", message.expiresAt().toString(),
+                                    "payload", message.payload()))
+                            .toList()));
+        });
+    }
+
+    @PostMapping("/events/ack")
+    @Operation(summary = "Подтвердить обработку сообщений",
+            description = "Курсор двигается только вперёд: запоздавший ответ не заставит "
+                    + "разослать уже обработанное заново.")
+    public ResponseEntity<?> ack(@Valid @RequestBody AckBody body, HttpServletRequest request) {
+        return guarded(request, () -> {
+            BotPlatform kind = BotPlatform.parse(body.platform())
+                    .orElseThrow(() -> new IllegalArgumentException(
+                            "Неизвестная платформа: " + body.platform()));
+            long cursor = core.botOutbox().acknowledge(kind, body.cursor()).join();
+            return ResponseEntity.ok(Map.of("cursor", cursor));
         });
     }
 
@@ -370,7 +430,11 @@ public class BotController {
 
     /** Ограничивает размер выборки: бот всё равно показывает несколько строк. */
     private static int bounded(int limit) {
-        return Math.min(50, Math.max(1, limit));
+        return bounded(limit, 50);
+    }
+
+    private static int bounded(int limit, int max) {
+        return Math.min(max, Math.max(1, limit));
     }
 
     /**

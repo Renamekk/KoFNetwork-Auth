@@ -5,6 +5,11 @@
 доступа к нему. Монтировать в них весь каталог конфигурации значило бы отдать
 контейнеру бота секреты базы и JWT, которые ему не нужны.
 
+По той же причине здесь больше нет настроек Redis. Прежде бот получал
+мастер-пароль хранилища ради чтения одного канала — вместе с правом
+переписывать состояния входа и публиковать любые события от имени системы.
+Сообщения приходят через ``/api/bot/events``, и ключа ``/api/bot`` достаточно.
+
 Имена переменных совпадают с теми, что уже использует docker-compose KoFAuth,
 поэтому отдельного файла для ботов не появляется.
 """
@@ -67,16 +72,29 @@ class ApiSettings:
 
 
 @dataclass(frozen=True, slots=True)
-class RedisSettings:
-    """Подписка на события KoFAuth.
+class OutboxSettings:
+    """Чтение очереди сообщений из ``/api/bot/events``.
 
-    Боты слушают тот же канал, в который пишет ``RedisEventBridge``. Свои
-    события они не публикуют: всё, что они делают, проходит через REST.
+    Раньше на этом месте были настройки Redis: адрес и канал. Боты получали
+    мастер-пароль хранилища — то есть право переписывать состояния входа,
+    привязки UUID и счётчики лимитов, а заодно публиковать любые доменные
+    события от имени системы. При этом доставка оставалась ненадёжной:
+    Pub/Sub не помнит сообщений, и перезапуск бота на пару секунд терял все
+    запросы подтверждения, пришедшие за это время.
+
+    Теперь боту нужен только ключ ``/api/bot``, а очередь живёт в базе:
+    короткий простой ничего не теряет.
+
+    :param platform: чья это очередь — ``TELEGRAM`` или ``DISCORD``
+    :param poll_interval: пауза между опросами, когда очередь пуста
+    :param max_backoff: потолок паузы при недоступном API
     """
 
-    url: str
-    channel: str = "kofauth:events"
+    platform: str
     enabled: bool = True
+    poll_interval: float = 2.0
+    max_backoff: float = 30.0
+    batch_size: int = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,24 +133,28 @@ class Settings:
     """Всё, что нужно любому из ботов."""
 
     api: ApiSettings
-    redis: RedisSettings
     telegram: TelegramSettings
     discord: DiscordSettings
     panel_url: str
     log_level: str
 
+    def outbox(self, platform: str) -> OutboxSettings:
+        """Настройки очереди для конкретной платформы."""
+        return OutboxSettings(
+            platform=platform,
+            enabled=_env_bool("KOFAUTH_EVENTS_ENABLED", True),
+            poll_interval=float(_env_int("KOFAUTH_EVENTS_POLL_SECONDS", 2)),
+            max_backoff=float(_env_int("KOFAUTH_EVENTS_MAX_BACKOFF_SECONDS", 30)),
+            batch_size=_env_int("KOFAUTH_EVENTS_BATCH_SIZE", 100),
+        )
+
     @staticmethod
-    def from_env() -> "Settings":
+    def from_env() -> Settings:
         return Settings(
             api=ApiSettings(
                 base_url=_env("KOFAUTH_API_URL", "http://webapi:8080").rstrip("/"),
                 bot_key=_env("KOFAUTH_SECURITY_BOT_API_KEY"),
                 timeout_seconds=float(_env_int("KOFAUTH_API_TIMEOUT_SECONDS", 10)),
-            ),
-            redis=RedisSettings(
-                url=_env("KOFAUTH_REDIS_URL", "redis://redis:6379/0"),
-                channel=_env("KOFAUTH_EVENT_CHANNEL", "kofauth:events"),
-                enabled=_env_bool("KOFAUTH_EVENTS_ENABLED", True),
             ),
             telegram=TelegramSettings(
                 token=_env("KOFAUTH_TELEGRAM_BOT_TOKEN"),

@@ -14,11 +14,17 @@ from typing import Any
 
 import discord
 from discord import app_commands
+from kofauth_common import (
+    ApiUnavailable,
+    BotMessage,
+    KoFAuthApi,
+    OutboxListener,
+    Settings,
+    texts,
+)
+from kofauth_common import events as event_kinds
 
-from kofauth_common import ApiUnavailable, Event, EventListener, KoFAuthApi, Settings
-from kofauth_common import texts
-
-from .views import ApprovalView, MenuView, PLATFORM, embed
+from .views import PLATFORM, ApprovalView, MenuView, embed
 
 LOGGER = logging.getLogger(__name__)
 
@@ -136,50 +142,40 @@ class DiscordBot(discord.Client):
                 ephemeral=True,
             )
 
-        @tree.command(name="sendcode", description="Код подтверждения входа")
-        async def sendcode_command(interaction: discord.Interaction) -> None:
-            result = await _safe(interaction, api.send_code(PLATFORM, interaction.user.id))
-            if result is None:
-                return
-            if not result.ok:
-                await interaction.response.send_message(
-                    texts.describe_error(result.error), ephemeral=True
-                )
-                return
-            code = result.data.get("code", "")
-            await interaction.response.send_message(
-                f"🔑 Код подтверждения входа:\n```\n{code}\n```\n"
-                f"Введите в игре: `/login пароль {code}`",
-                ephemeral=True,
-            )
-
         @tree.command(name="login", description="Как подтвердить вход")
         async def login_command(interaction: discord.Interaction) -> None:
             await interaction.response.send_message(
                 "Подтверждение входа приходит в личные сообщения само, "
                 "когда вы заходите в игру.\n\n"
-                "Если сообщение не пришло — возьмите код командой `/sendcode`.",
+                "Вводить в игре ничего не нужно. Если сообщение не пришло — "
+                "повторите вход в Minecraft, запрос придёт заново.",
                 ephemeral=True,
             )
 
     # ------------------------------------------------------------------ уведомления
 
-    async def request_approval(self, discord_id: int, token: str, username: str,
-                               ip: str, location: str) -> None:
+    async def request_approval(self, message: BotMessage) -> None:
         """Присылает запрос подтверждения входа в личные сообщения."""
-        user = await self._resolve(discord_id)
+        recipient = message.recipient_id
+        user = await self._resolve(recipient)
         if user is None:
             return
-        lines = texts.approval_request_lines(username, ip, location)
+        lines = texts.approval_request_lines(
+            message.get("username", "—"),
+            message.get("ip", "—"),
+            texts.format_location(message.get("country"), message.get("city")),
+        )
         try:
             await user.send(
                 embed=embed("🔐 " + lines[0], lines[1:], colour=0xFFB020),
-                view=ApprovalView(self._api, token),
+                view=ApprovalView(self._api, message.get("approvalId"), recipient),
             )
         except discord.HTTPException as exc:
-            # Личные сообщения могут быть закрыты — это выбор человека,
-            # а не сбой системы. Запасной путь: /sendcode.
-            LOGGER.info("Не удалось написать %s: %s", discord_id, exc)
+            # Личные сообщения могут быть закрыты — это выбор человека, а не сбой
+            # системы. Запасного пути с кодом больше нет и быть не должно: код
+            # можно было получить без всякой попытки входа. Игрок повторяет вход,
+            # и запрос приходит заново.
+            LOGGER.info("Не удалось написать %s: %s", recipient, exc)
 
     async def notify(self, discord_id: int, title: str, lines: list[str]) -> None:
         user = await self._resolve(discord_id)
@@ -225,39 +221,45 @@ async def _screen(interaction: discord.Interaction, api: KoFAuthApi, title: str,
     )
 
 
-def register_event_handlers(bot: DiscordBot, listener: EventListener) -> None:
-    """Подписывает бота на события KoFAuth."""
+def register_message_handlers(bot: DiscordBot, listener: OutboxListener) -> None:
+    """Подписывает бота на очередь сообщений.
 
-    async def on_approval(event: Event) -> None:
-        discord_id = event.get("discordId")
-        token = event.get("approvalToken")
-        if not discord_id.isdigit() or not token:
-            return
-        await bot.request_approval(
-            int(discord_id), token, event.get("username", "—"),
-            event.get("ipMasked", "—"),
-            texts.format_location(event.get("country"), event.get("city")),
-        )
+    Discord обрабатывается как Discord: платформа приходит в самом сообщении и
+    используется и при чтении очереди, и при отправке решения. Прежде запрос
+    подтверждения приезжал общим событием, а решение уходило на сервер без
+    указания платформы — и записывалось как телеграмное.
 
-    async def on_notice(event: Event) -> None:
-        discord_id = event.get("discordId")
-        if not discord_id.isdigit():
+    Доставка «не меньше одного раза»: одно и то же сообщение может прийти
+    дважды, если бот упал между обработкой и подтверждением. Это безопасно —
+    повторно показанная кнопка ведёт к тому же самому запросу.
+    """
+
+    async def on_approval(message: BotMessage) -> None:
+        if not message.get("approvalId") or not message.recipient_id:
             return
-        notice = NOTICES.get(event.type)
-        if notice is None:
+        await bot.request_approval(message)
+
+    async def on_resolved(message: BotMessage) -> None:
+        LOGGER.debug("Запрос %s закрыт со статусом %s",
+                     message.get("approvalId"), message.get("status"))
+
+    async def on_notice(message: BotMessage) -> None:
+        notice = NOTICES.get(message.get("event"))
+        if notice is None or not message.recipient_id:
             return
         title, template = notice
-        await bot.notify(int(discord_id), title, [
+        await bot.notify(message.recipient_id, title, [
             template.format(
-                username=event.get("username", ""),
-                ip=event.get("ipMasked", "—"),
-                at=texts.format_time(event.get("at")),
+                username=message.get("username", ""),
+                ip=message.get("ip", "—"),
+                at=texts.format_time(message.get("at")),
             )
         ])
 
-    listener.on("LoginApprovalRequestedEvent", on_approval)
-    for event_type in NOTICES:
-        listener.on(event_type, on_notice)
+    listener.on(event_kinds.LOGIN_APPROVAL, on_approval)
+    listener.on(event_kinds.LOGIN_APPROVAL_RESOLVED, on_resolved)
+    listener.on(event_kinds.LOGIN_NOTICE, on_notice)
+    listener.on(event_kinds.SECURITY_NOTICE, on_notice)
 
 
 NOTICES = {

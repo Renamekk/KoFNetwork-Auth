@@ -3,20 +3,23 @@ package net.kofnetwork.auth.velocity.command;
 import com.velocitypowered.api.command.CommandSource;
 import com.velocitypowered.api.command.SimpleCommand;
 import com.velocitypowered.api.proxy.Player;
-import com.velocitypowered.api.proxy.server.RegisteredServer;
+import net.kofnetwork.auth.api.config.ConfigFile;
 import net.kofnetwork.auth.api.dto.AuthContext;
 import net.kofnetwork.auth.api.dto.LoginRequest;
 import net.kofnetwork.auth.api.model.AuthState;
 import net.kofnetwork.auth.api.model.IpAddress;
+import net.kofnetwork.auth.api.model.LoginApproval;
+import net.kofnetwork.auth.api.model.TwoFactorMethod;
 import net.kofnetwork.auth.api.result.AuthResult;
 import net.kofnetwork.auth.core.KoFAuthCore;
-import net.kofnetwork.auth.velocity.limbo.LimboRouter;
+import net.kofnetwork.auth.velocity.limbo.PlayerTransfer;
+import net.kofnetwork.auth.velocity.listener.PendingLogins;
 import net.kofnetwork.auth.velocity.message.MessageService;
 import org.slf4j.Logger;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 /**
  * Команда {@code /login <пароль>}.
@@ -28,14 +31,17 @@ import java.util.Optional;
 public final class LoginCommand implements SimpleCommand {
 
     private final KoFAuthCore core;
-    private final LimboRouter router;
+    private final PlayerTransfer transfer;
     private final MessageService messages;
+    private final PendingLogins pendingLogins;
     private final Logger logger;
 
-    public LoginCommand(KoFAuthCore core, LimboRouter router, MessageService messages, Logger logger) {
+    public LoginCommand(KoFAuthCore core, PlayerTransfer transfer, MessageService messages,
+                        PendingLogins pendingLogins, Logger logger) {
         this.core = core;
-        this.router = router;
+        this.transfer = transfer;
         this.messages = messages;
+        this.pendingLogins = pendingLogins;
         this.logger = logger;
     }
 
@@ -48,12 +54,12 @@ public final class LoginCommand implements SimpleCommand {
         }
 
         String[] args = invocation.arguments();
-        // Второй аргумент — код второго фактора: TOTP либо код из бота, взятый
-        // командой /sendcode. Он необязателен: при двухшаговом входе игрок сначала
-        // получает запрос подтверждения и вводит код отдельно.
+        // Второй аргумент — код приложения-аутентификатора (TOTP), и только он.
+        // Кодов подтверждения через мессенджер больше нет: Telegram и Discord
+        // присылают кнопки, а вводить в игре что-либо не требуется.
         if (args.length < 1 || args.length > 2) {
             player.sendMessage(messages.prefixed("login-usage",
-                    "<yellow>Использование: <white>/login <пароль> [код]"));
+                    "<yellow>Использование: <white>/login <пароль> [код TOTP]"));
             return;
         }
 
@@ -69,6 +75,14 @@ public final class LoginCommand implements SimpleCommand {
                 return;
             }
             performLogin(player, args[0], args.length > 1 ? args[1] : null);
+        }).exceptionally(e -> {
+            // Состояние не прочитано — хранилище недоступно. Пускать «на всякий
+            // случай» нельзя: именно так и выглядит вход без проверки.
+            logger.error("Состояние игрока {} недоступно, вход отклонён",
+                    player.getUsername(), e);
+            player.sendMessage(messages.prefixed("unavailable",
+                    "<red>Сервер авторизации недоступен. Попробуйте позже."));
+            return null;
         });
     }
 
@@ -99,12 +113,7 @@ public final class LoginCommand implements SimpleCommand {
         switch (result.type()) {
             case SUCCESS -> onSuccess(player, result);
 
-            case TWO_FACTOR_REQUIRED -> {
-                core.sessions().setState(player.getUniqueId(), AuthState.TWO_FACTOR_REQUIRED);
-                player.sendMessage(messages.prefixed("two-factor-required",
-                        "<yellow>Требуется подтверждение: <white><method>",
-                        Map.of("method", String.valueOf(result.requiredTwoFactor()))));
-            }
+            case TWO_FACTOR_REQUIRED -> onTwoFactorRequired(player, result);
 
             case CAPTCHA_REQUIRED -> {
                 core.sessions().setState(player.getUniqueId(), AuthState.CAPTCHA_REQUIRED);
@@ -154,6 +163,43 @@ public final class LoginCommand implements SimpleCommand {
     }
 
     /**
+     * Пароль принят, но нужен второй фактор.
+     *
+     * <p>Для мессенджеров игрок ничего не вводит — он нажимает кнопку в своём чате.
+     * Метка попытки запоминается здесь: по ней решение владельца будет сопоставлено
+     * именно с этим входом, а не с предыдущим, от которого игрок уже отказался.
+     * Заодно эта отметка освобождает игрока от отключения по общему таймауту:
+     * ждать кнопку дольше, чем набирать пароль, — нормально.
+     */
+    private void onTwoFactorRequired(Player player, AuthResult result) {
+        TwoFactorMethod method = result.requiredTwoFactor();
+        String attemptId = result.attemptId();
+
+        if (attemptId != null) {
+            Duration window = core.config().getDuration(ConfigFile.SECURITY,
+                    "two-factor.approval-lifetime", LoginApproval.DEFAULT_LIFETIME);
+            pendingLogins.awaitingApproval(player.getUniqueId(), attemptId, window);
+        }
+
+        core.sessions().setState(player.getUniqueId(), AuthState.TWO_FACTOR_REQUIRED)
+                .whenComplete((ignored, failure) -> {
+                    if (failure != null) {
+                        logger.error("Не удалось записать состояние ожидания у {}",
+                                player.getUsername(), failure);
+                        player.sendMessage(messages.prefixed("unavailable",
+                                "<red>Сервер авторизации недоступен. Попробуйте позже."));
+                        return;
+                    }
+                    player.sendMessage(attemptId == null
+                            ? messages.prefixed("two-factor-required",
+                                    "<yellow>Введите код приложения: <white>/login <пароль> <код>")
+                            : messages.prefixed("approval-required",
+                                    "<yellow>Подтвердите вход кнопкой в <white><method></white>.",
+                                    Map.of("method", String.valueOf(method))));
+                });
+    }
+
+    /**
      * Завершение успешного входа.
      *
      * <p>Привязку UUID к сессии здесь не ставим — её записывает Core внутри
@@ -163,25 +209,46 @@ public final class LoginCommand implements SimpleCommand {
      * <p>Состояние задаётся через {@code resetState}: пароль принят, и остаток
      * прошлого состояния (например {@code BLOCKED} после отзыва сессии) не должен
      * отменять только что состоявшийся вход.
+     *
+     * <p><b>Отметка о завершении ставится до перевода.</b> Перевод на хаб занимает
+     * время, и раньше именно в нём игрок успевал попасть под отключение по таймауту —
+     * получалось «Вы не успели войти» сразу после верного пароля.
      */
     private void onSuccess(Player player, AuthResult result) {
+        pendingLogins.completed(player.getUniqueId());
+
         core.sessions().resetState(player.getUniqueId(), AuthState.AUTHENTICATED)
-                .thenRun(() -> {
+                .whenComplete((ignored, failure) -> {
+                    if (failure != null) {
+                        logger.error("Вход игрока {} состоялся, но состояние не записано",
+                                player.getUsername(), failure);
+                        player.disconnect(messages.kick("unavailable",
+                                "<red>Сервер авторизации недоступен. Подключитесь заново."));
+                        return;
+                    }
                     player.sendMessage(messages.prefixed("login-success",
                             "<green>Вход выполнен. Приятной игры!"));
-                    sendToLobby(player);
+                    sendToHub(player);
                 });
     }
 
-    private void sendToLobby(Player player) {
-        Optional<RegisteredServer> lobby = router.selectLobby();
-        if (lobby.isEmpty()) {
-            logger.error("Нет доступного лобби для игрока {}", player.getUsername());
-            player.sendMessage(messages.prefixed("lobby-unavailable",
-                    "<red>Лобби недоступно. Сообщите администрации."));
-            return;
-        }
-        player.createConnectionRequest(lobby.get()).fireAndForget();
+    /**
+     * Переводит игрока на хаб.
+     *
+     * <p>Результат разбирается, а не отбрасывается. Прежний {@code fireAndForget()}
+     * не сообщал ни об отказе хаба, ни об отсутствии свободного: игрок с полноценной
+     * сессией просто оставался стоять в Limbo, не понимая, что произошло.
+     */
+    private void sendToHub(Player player) {
+        transfer.toHub(player).thenAccept(outcome -> {
+            if (outcome.success()) {
+                return;
+            }
+            logger.error("Игрока {} не удалось перевести на хаб: {}",
+                    player.getUsername(), outcome.detail());
+            player.sendMessage(messages.prefixed("hub-unavailable",
+                    "<red>Хаб недоступен. Сообщите администрации."));
+        });
     }
 
     @Override

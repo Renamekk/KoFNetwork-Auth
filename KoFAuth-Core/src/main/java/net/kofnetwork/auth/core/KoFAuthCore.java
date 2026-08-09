@@ -6,8 +6,10 @@ import net.kofnetwork.auth.api.config.ConfigFile;
 import net.kofnetwork.auth.api.config.ConfigurationService;
 import net.kofnetwork.auth.api.event.EventBus;
 import net.kofnetwork.auth.api.exception.ConfigurationException;
+import net.kofnetwork.auth.api.repository.BotOutboxRepository;
 import net.kofnetwork.auth.api.service.AuditService;
 import net.kofnetwork.auth.api.service.AuthenticationService;
+import net.kofnetwork.auth.api.service.LoginApprovalService;
 import net.kofnetwork.auth.api.service.CaptchaService;
 import net.kofnetwork.auth.api.service.EmailService;
 import net.kofnetwork.auth.api.service.LinkService;
@@ -17,7 +19,7 @@ import net.kofnetwork.auth.api.service.SessionService;
 import net.kofnetwork.auth.api.service.TokenService;
 import net.kofnetwork.auth.api.service.TotpService;
 import net.kofnetwork.auth.core.cache.CacheProvider;
-import net.kofnetwork.auth.core.cache.NoopCacheProvider;
+import net.kofnetwork.auth.core.cache.LocalCacheProvider;
 import net.kofnetwork.auth.core.cache.RedisCacheProvider;
 import net.kofnetwork.auth.core.concurrent.AsyncExecutors;
 import net.kofnetwork.auth.core.config.YamlConfigurationService;
@@ -27,12 +29,15 @@ import net.kofnetwork.auth.core.event.RedisEventBridge;
 import net.kofnetwork.auth.core.event.SimpleEventBus;
 import net.kofnetwork.auth.core.mail.MailTemplateEngine;
 import net.kofnetwork.auth.core.mail.SmtpMailSender;
+import net.kofnetwork.auth.core.notify.BotNotificationListener;
 import net.kofnetwork.auth.core.notify.EmailNotificationListener;
 import net.kofnetwork.auth.core.repository.jdbc.JdbcAccountRepository;
+import net.kofnetwork.auth.core.repository.jdbc.JdbcBotOutboxRepository;
 import net.kofnetwork.auth.core.repository.jdbc.JdbcCaptchaRepository;
 import net.kofnetwork.auth.core.repository.jdbc.JdbcDeviceRepository;
 import net.kofnetwork.auth.core.repository.jdbc.JdbcDiscordRepository;
 import net.kofnetwork.auth.core.repository.jdbc.JdbcEmailRepository;
+import net.kofnetwork.auth.core.repository.jdbc.JdbcLoginApprovalRepository;
 import net.kofnetwork.auth.core.repository.jdbc.JdbcLoginHistoryRepository;
 import net.kofnetwork.auth.core.repository.jdbc.JdbcRoleRepository;
 import net.kofnetwork.auth.core.repository.jdbc.JdbcSecurityLogRepository;
@@ -51,6 +56,7 @@ import net.kofnetwork.auth.core.service.impl.AuthenticationServiceImpl;
 import net.kofnetwork.auth.core.service.impl.CaptchaServiceImpl;
 import net.kofnetwork.auth.core.service.impl.EmailServiceImpl;
 import net.kofnetwork.auth.core.service.impl.LinkServiceImpl;
+import net.kofnetwork.auth.core.service.impl.LoginApprovalServiceImpl;
 import net.kofnetwork.auth.core.service.impl.RegistrationServiceImpl;
 import net.kofnetwork.auth.core.service.impl.SecurityServiceImpl;
 import net.kofnetwork.auth.core.service.impl.SessionServiceImpl;
@@ -100,10 +106,13 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
     private final TotpService totp;
     private final LinkService links;
     private final TokenService tokens;
+    private final LoginApprovalService approvals;
+    private final BotOutboxRepository botOutbox;
     private final AuditServiceImpl audit;
     private final AdminOperations adminOperations;
     private final AccountTransfer transfer;
     private final EmailNotificationListener emailNotifications;
+    private final BotNotificationListener botNotifications;
 
     private volatile boolean ready;
 
@@ -124,8 +133,10 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
         config.registerReloadable(database);
         SqlExecutor sql = new SqlExecutor(database, executors);
 
-        // ---- 4. Кэш. Отсутствие Redis — не отказ: подставляется заглушка,
-        //         и система продолжает работать, потеряв межпроцессную связность.
+        // ---- 4. Хранилище состояния. Не кэш: здесь живут машина входа, привязка
+        //         UUID к сессии и счётчики лимитов, у которых нет копии в MySQL.
+        //         Отключённый настройкой Redis и недоступный Redis — разные случаи,
+        //         см. createCache().
         this.cache = createCache();
 
         // ---- 5. Шина событий.
@@ -159,6 +170,8 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
         var roleRepo = new JdbcRoleRepository(sql);
         var settingsRepo = new JdbcSettingsRepository(sql);
         var serverRepo = new JdbcServerRepository(sql);
+        var approvalRepo = new JdbcLoginApprovalRepository(sql);
+        var outboxRepo = new JdbcBotOutboxRepository(sql);
 
         // ---- 8. Сервисы. Порядок продиктован зависимостями между ними.
         this.audit = new AuditServiceImpl(auditRepo, historyRepo, executors.scheduler());
@@ -180,8 +193,22 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
         this.registration = new RegistrationServiceImpl(accountRepo, roleRepo, settingsRepo,
                 sessions, security, audit, hasher, policy, config, eventBus);
 
-        this.authentication = new AuthenticationServiceImpl(accountRepo, deviceRepo, historyRepo,
-                sessions, security, totp, tokens, email, audit, hasher, policy, config, eventBus);
+        // Подтверждения строятся до аутентификации, а обратная связь подставляется
+        // после: аутентификация выпускает подтверждения, подтверждения завершают
+        // аутентификацию. Разорвать цикл конструкторами нельзя, поэтому одна из
+        // сторон получает ссылку отдельным шагом — и это именно та сторона, где
+        // отсутствие ссылки безопасно: до подстановки одобрение просто не создаст
+        // сессию, а не пропустит вход мимо проверки.
+        LoginApprovalServiceImpl approvalService = new LoginApprovalServiceImpl(
+                approvalRepo, outboxRepo, links, audit, eventBus, config);
+        this.approvals = approvalService;
+        this.botOutbox = outboxRepo;
+
+        AuthenticationServiceImpl authenticationService = new AuthenticationServiceImpl(
+                accountRepo, deviceRepo, historyRepo, sessions, security, totp, tokens, email,
+                audit, approvalService, hasher, policy, config, eventBus);
+        this.authentication = authenticationService;
+        approvalService.attachCompleter(authenticationService::completeApprovedLogin);
 
         this.adminOperations = new AdminOperations(accountRepo, deviceRepo, roleRepo, settingsRepo);
         this.transfer = new AccountTransfer(accountRepo, executors.io());
@@ -191,8 +218,15 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
         this.emailNotifications = new EmailNotificationListener(email, config);
         this.emailNotifications.register(eventBus);
 
+        // Уведомления ботам собираются здесь и кладутся в очередь. Раньше боты
+        // читали ту же шину сами — мастер-паролем Redis, то есть с правом
+        // переписывать состояние входа всей сети.
+        this.botNotifications = new BotNotificationListener(outboxRepo, links);
+        this.botNotifications.register(eventBus);
+
         // ---- 9. Фоновое обслуживание.
-        scheduleMaintenance(sessionRepo, tokenRepo, captchaRepo, auditRepo, deviceRepo, roleRepo);
+        scheduleMaintenance(sessionRepo, tokenRepo, captchaRepo, auditRepo, deviceRepo, roleRepo,
+                approvalRepo, outboxRepo);
 
         this.ready = true;
         LOGGER.info("KoFAuth {} запущен (кэш: {})", VERSION, cache.providerName());
@@ -215,20 +249,43 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
         return value;
     }
 
+    /**
+     * Выбирает хранилище состояния.
+     *
+     * <p><b>Отключён и недоступен — разные вещи.</b> Раньше оба случая приводили к
+     * заглушке, отвечающей «нет данных» на любой запрос. Между тем в Redis лежит не
+     * кэш, а состояние: машина входа, привязка UUID к сессии, счётчики ограничения
+     * скорости, межпроцессная синхронизация. Копии в MySQL у них нет. Заглушка на
+     * месте Redis означала, что вошедший игрок мгновенно становился неаутентифицированным,
+     * ограничение скорости переставало считаться, а отзыв сессии не доходил до соседей —
+     * и всё это выглядело как исправная работа.
+     *
+     * <p>Поэтому решений теперь два:
+     * <ul>
+     *   <li>{@code redis.enabled: false} — осознанный выбор односерверной установки.
+     *       Подставляется хранилище в памяти процесса: оно честно работает, просто не
+     *       делится состоянием с соседями (которых в такой установке и нет);</li>
+     *   <li>{@code redis.enabled: true}, но подключиться не удалось — авария.
+     *       Запуск прекращается. Прокси, поднявшийся без общего состояния, пропустит
+     *       игроков мимо аутентификации; отказ на старте заметен и чинится, молчаливая
+     *       деградация — нет.</li>
+     * </ul>
+     */
     private CacheProvider createCache() {
         if (!config.getBoolean(ConfigFile.DATABASE, "redis.enabled", true)) {
-            LOGGER.info("Redis отключён конфигурацией: сессии и события останутся "
-                    + "в пределах процесса");
-            return new NoopCacheProvider();
+            LOGGER.warn("Redis отключён конфигурацией: состояние входа хранится в памяти "
+                    + "процесса. Это допустимо только для установки из одного прокси и "
+                    + "одного бэкенда — иначе узлы не увидят сессий друг друга.");
+            return new LocalCacheProvider();
         }
         try {
             return RedisCacheProvider.connect(config);
         } catch (RuntimeException e) {
-            // Redis настроен, но недоступен. Останавливать сеть из-за кэша нельзя:
-            // деградируем и продолжаем работать по MySQL.
-            LOGGER.error("Redis недоступен, работаем без кэша. Сессии не будут общими "
-                    + "между процессами.", e);
-            return new NoopCacheProvider();
+            throw new ConfigurationException(
+                    "Redis включён в database.yml, но недоступен. Запуск прекращён: без общего "
+                            + "хранилища состояния прокси не может отличить вошедшего игрока от "
+                            + "не вошедшего. Поднимите Redis либо укажите redis.enabled: false, "
+                            + "если сеть состоит из одного узла. Причина: " + e.getMessage(), e);
         }
     }
 
@@ -259,7 +316,9 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
                                      JdbcCaptchaRepository captchaRepo,
                                      JdbcSecurityLogRepository auditRepo,
                                      JdbcDeviceRepository deviceRepo,
-                                     JdbcRoleRepository roleRepo) {
+                                     JdbcRoleRepository roleRepo,
+                                     JdbcLoginApprovalRepository approvalRepo,
+                                     JdbcBotOutboxRepository outboxRepo) {
         Duration interval = config.getDuration(ConfigFile.CONFIG,
                 "maintenance.cleanup-interval", Duration.ofHours(1));
         Duration auditRetention = config.getDuration(ConfigFile.CONFIG,
@@ -277,6 +336,11 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
                 auditRepo.deleteInfoBefore(now.minus(auditRetention)).join();
                 deviceRepo.deleteStale(now.minus(deviceRetention)).join();
                 roleRepo.purgeExpiredGrants(now).join();
+                // Просроченное подтверждение обязано перестать быть PENDING: иначе
+                // запрос новой попытки видит «уже есть ожидающий» и не появляется.
+                approvalRepo.expireOverdue(now).join();
+                approvalRepo.deleteDecidedBefore(now.minus(Duration.ofDays(7))).join();
+                outboxRepo.deleteExpired(now).join();
             } catch (RuntimeException e) {
                 // Сбой чистки не должен останавливать планировщик: при выброшенном
                 // исключении scheduleWithFixedDelay больше не запустится никогда.
@@ -332,6 +396,21 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
         return tokens;
     }
 
+    /** Подтверждения входа кнопкой в мессенджере. */
+    public @NotNull LoginApprovalService approvals() {
+        return approvals;
+    }
+
+    /**
+     * Очередь сообщений ботам.
+     *
+     * <p>Отдаётся наружу ради {@code /api/bot/events}: именно через него боты
+     * получают то, что раньше читали из Redis мастер-паролем.
+     */
+    public @NotNull BotOutboxRepository botOutbox() {
+        return botOutbox;
+    }
+
     @Override
     public @NotNull AuditService audit() {
         return audit;
@@ -357,9 +436,32 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
         return VERSION;
     }
 
+    /**
+     * Готовность отражает состояние зависимостей, а не только собственный флаг.
+     *
+     * <p>Хранилище состояния входит в проверку наравне с базой. Раньше его здесь не
+     * было, и упавший Redis не влиял на готовность: балансировщик продолжал слать
+     * трафик, прокси — принимать игроков, а система при этом не могла ни отличить
+     * вошедшего от невошедшего, ни посчитать ограничение скорости. Отказ, о котором
+     * никто не сообщает, — это тот же fail-open, только на уровне эксплуатации.
+     */
     @Override
     public boolean isReady() {
-        return ready && database.isHealthy();
+        return ready && database.isHealthy() && cache.isAvailable();
+    }
+
+    /** Что именно не в порядке — для {@code /actuator/health} и {@code /auth info}. */
+    public @NotNull String readinessDetail() {
+        if (!ready) {
+            return "Система останавливается";
+        }
+        if (!database.isHealthy()) {
+            return "База данных недоступна";
+        }
+        if (!cache.isAvailable()) {
+            return "Хранилище состояния (" + cache.providerName() + ") недоступно";
+        }
+        return "OK";
     }
 
     /** Пулы — платформенным модулям, которым нужен планировщик. */
@@ -425,6 +527,7 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
 
         try {
             emailNotifications.close();
+            botNotifications.close();
             eventBus.close();
         } catch (RuntimeException e) {
             LOGGER.warn("Ошибка при остановке шины событий", e);

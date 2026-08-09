@@ -70,6 +70,24 @@
                                     </excludes>
                                 </filter>
                             </filters>
+                            <!--
+                                Объединение META-INF/services обязательно.
+
+                                Flyway ищет свои расширения — в том числе поддержку
+                                MySQL из flyway-mysql — через ServiceLoader. Без
+                                объединения shade оставляет один файл дескриптора и
+                                молча теряет остальные: сборка зелёная, jar на месте,
+                                а миграции при запуске падают с «no database found to
+                                handle jdbc:mysql». Внутри Compose это не всплывало,
+                                потому что схему там накатывает отдельный процесс,
+                                и первым же местом отказа становился запуск плагина
+                                на живом сервере.
+
+                                То же касается драйвера JDBC и провайдеров SLF4J.
+                            -->
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            </transformers>
                             <relocations>
                                 <relocation>
                                     <pattern>com.zaxxer.hikari</pattern>

@@ -6,9 +6,9 @@ import asyncio
 import logging
 import signal
 
-from kofauth_common import ConfigurationError, EventListener, KoFAuthApi, Settings
+from kofauth_common import ConfigurationError, KoFAuthApi, OutboxListener, Settings
 
-from .bot import TelegramBot, register_event_handlers
+from .bot import TelegramBot, register_message_handlers
 
 LOGGER = logging.getLogger("kofauth.telegram")
 
@@ -30,8 +30,8 @@ async def main() -> int:
         return 1
 
     bot = TelegramBot(settings, api)
-    listener = EventListener(settings.redis)
-    register_event_handlers(bot, listener)
+    listener = OutboxListener(api, settings.outbox("TELEGRAM"))
+    register_message_handlers(bot, listener)
 
     await listener.start()
     LOGGER.info("Telegram-бот запущен")

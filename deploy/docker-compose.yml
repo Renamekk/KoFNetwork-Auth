@@ -1,16 +1,18 @@
 # =============================================================================
 #  KoFAuth — весь стек одной командой.
 #
-#  Здесь лежит ВСЁ, что нужно сети: база, кэш, веб-API с личным кабинетом,
-#  прокси Velocity, Limbo и лобби на Paper, боты Telegram и Discord, HTTPS.
+#  Здесь лежит ВСЁ, что нужно сети: база, хранилище состояния, веб-API с личным
+#  кабинетом, прокси Velocity, Limbo и хабы на Paper, боты Telegram и Discord
+#  (на Python, из ../bots), HTTPS.
 #
 #  Обычный запуск:  ./install.sh   (создаст .env, соберёт jar, поднимет стек)
 #  Дальше:          ./kofauth.sh start | stop | logs | status | update
 #
 #  Профили (задаются в COMPOSE_PROFILES в .env):
 #    (без профиля)     — mysql, redis, webapi, velocity, limbo — основа сети
-#    lobby             — игровой сервер «из коробки»; уберите, если он уже свой,
-#                        и укажите его адрес в LOBBY_ADDRESS
+#    lobby             — игровой сервер «из коробки», регистрируется в Velocity
+#                        как hub-1; уберите, если он уже свой, и укажите его
+#                        адрес в LOBBY_ADDRESS
 #    telegram, discord — боты по отдельности; bots — оба сразу
 #    web               — caddy, HTTPS для личного кабинета
 #    build             — разовая сборка jar, вызывается install.sh, не поднимается
@@ -75,15 +77,22 @@ x-logging: &logging
     max-size: "10m"
     max-file: "5"
 
-# Настройки, нужные ботам. Их набор намеренно узкий: бот знает адрес REST,
-# ключ доступа к нему и канал событий — и ничего о базе.
+# Настройки, нужные ботам. Набор намеренно узкий: бот знает адрес REST и ключ
+# доступа к нему — и больше ничего.
+#
+# Пароля Redis здесь БОЛЬШЕ НЕТ, и это главное изменение. Раньше бот получал
+# мастер-пароль хранилища ради чтения одного канала: вместе с ним он получал
+# право переписывать состояния входа, привязки UUID и счётчики лимитов и
+# публиковать любые доменные события от имени системы. При этом доставка всё
+# равно теряла сообщения — Pub/Sub не помнит ничего, и перезапуск бота на две
+# секунды стирал все пришедшие за это время запросы подтверждения.
+#
+# Теперь сообщения приходят из долговечной очереди через /api/bot/events.
 x-bot-env: &bot-env
   KOFAUTH_API_URL: http://webapi:8080
   KOFAUTH_SECURITY_BOT_API_KEY: ${BOT_API_KEY:?нет в .env — запустите ./install.sh}
-  # Пароль обязателен: redis-server запущен с requirepass. Без него
-  # подписка отвергается, и боты работают без уведомлений.
-  KOFAUTH_REDIS_URL: redis://:${REDIS_PASSWORD:?нет в .env}@redis:6379/0
-  KOFAUTH_EVENT_CHANNEL: kofauth:events
+  # Как часто опрашивать очередь, когда она пуста.
+  KOFAUTH_EVENTS_POLL_SECONDS: ${BOT_POLL_SECONDS:-2}
   KOFAUTH_PANEL_URL: ${PANEL_URL:-http://127.0.0.1:8080}
   KOFAUTH_LOG_LEVEL: ${LOG_LEVEL:-INFO}
   TZ: UTC
@@ -96,8 +105,8 @@ x-python-bot: &python-bot
   image: kofauth/bots:1.0.0
   restart: unless-stopped
   depends_on:
+    # Redis боту больше не нужен: очередь читается через webapi.
     webapi: {condition: service_healthy}
-    redis: {condition: service_healthy}
   networks: [kofauth]
   logging: *logging
 
@@ -217,8 +226,8 @@ services:
       webapi: {condition: service_healthy}
     environment:
       <<: *kofauth-env
-      KOFAUTH_VELOCITY_LIMBO_SERVERS: limbo-1
-      KOFAUTH_VELOCITY_LOBBY_SERVERS: lobby-1
+      KOFAUTH_VELOCITY_LIMBO_SERVERS: "limbo-1,limbo-2,limbo-3,limbo-4,limbo-5"
+      KOFAUTH_VELOCITY_HUB_SERVERS: "hub-1,hub-2,hub-3,hub-4,hub-5,hub-6,hub-7,hub-8,hub-9,hub-10"
       TYPE: VELOCITY
       VELOCITY_VERSION: 3.4.0-SNAPSHOT
       VELOCITY_BUILD_ID: "563"
@@ -296,7 +305,7 @@ services:
       ENABLE_RCON: "FALSE"
       ENABLE_QUERY: "FALSE"
       SERVER_PORT: "25565"
-      MAX_PLAYERS: ${MAX_PLAYERS:-500}
+      MAX_PLAYERS: ${LIMBO_MAX_PLAYERS:-50}
       # Смотреть в Limbo не на что, а при заходе ботнета каждый чанк —
       # это трафик и память.
       VIEW_DISTANCE: "2"
@@ -453,23 +462,27 @@ services:
         cp KoFAuth-Velocity/target/KoFAuth-Velocity-*.jar /artifacts/kofauth-velocity.jar
         cp KoFAuth-Paper/target/KoFAuth-Paper-*.jar       /artifacts/kofauth-paper.jar
         cp KoFAuth-WebAPI/target/KoFAuth-WebAPI-*.jar     /artifacts/kofauth-webapi.jar
-        cp KoFAuth-Telegram/target/KoFAuth-Telegram-*.jar /artifacts/kofauth-telegram.jar
-        cp KoFAuth-Discord/target/KoFAuth-Discord-*.jar   /artifacts/kofauth-discord.jar
+        # Модулей KoFAuth-Telegram и KoFAuth-Discord больше нет: боты переехали
+        # в ../bots и собираются образом kofauth/bots. Копирование их jar здесь
+        # оставалось после переезда и роняло сборку на первом же запуске.
+        echo "==> Проверка итоговых jar"
         # Дескриптор плагина Velocity генерируется аннотационным процессором.
         # С JDK 22+ он молча не запускается без -proc:full, и тогда сборка
         # зелёная, jar на месте, а плагин прокси не виден вовсе.
-        jar tf /artifacts/kofauth-velocity.jar | grep -qx velocity-plugin.json \
-          || { echo "ОШИБКА: в jar нет velocity-plugin.json — плагин не запустится"; exit 1; }
+        jar tf /artifacts/kofauth-velocity.jar | grep -qx velocity-plugin.json           || { echo "ОШИБКА: в jar нет velocity-plugin.json — плагин не запустится"; exit 1; }
+        # Flyway ищет реализации через META-INF/services. При сборке shade без
+        # объединения дескрипторов файл из одного jar затирает такой же из
+        # другого, и поддержка MySQL пропадает: миграции не применяются, а
+        # ошибка выглядит как «no database found to handle jdbc:mysql».
+        for j in velocity paper; do
+          jar tf /artifacts/kofauth-$$j.jar             | grep -q 'META-INF/services/org.flywaydb.core.extensibility.Plugin'             || { echo "ОШИБКА: в jar $$j нет дескрипторов Flyway — миграции не запустятся"; exit 1; }
+          unzip -p /artifacts/kofauth-$$j.jar             META-INF/services/org.flywaydb.core.extensibility.Plugin             | grep -q 'org.flywaydb.database.mysql'             || { echo "ОШИБКА: в jar $$j нет провайдера MySQL для Flyway"; exit 1; }
+        done
         # Реализация SLF4J: без неё процесс запускается и работает, но не пишет
         # ни одной строки лога — включая ошибки хранилища и события безопасности.
-        # В webapi это вложенный jar, в ботах — распакованные классы shade-плагина.
         # Доллар удваивается: compose подставляет переменные и в тело команды,
         # и одинарный $$m превратился бы в пустую строку ещё до запуска shell.
-        for m in webapi telegram discord; do
-          jar tf /artifacts/kofauth-$$m.jar \
-            | grep -qE 'logback-classic|ch/qos/logback/classic/Logger.class' \
-            || { echo "ОШИБКА: в jar $$m нет реализации SLF4J — процесс будет работать без логов"; exit 1; }
-        done
+        jar tf /artifacts/kofauth-webapi.jar           | grep -qE 'logback-classic|ch/qos/logback/classic/Logger.class'           || { echo "ОШИБКА: в jar webapi нет реализации SLF4J — процесс будет работать без логов"; exit 1; }
         chmod 0644 /artifacts/*.jar
         ls -la /artifacts
     networks: [kofauth]

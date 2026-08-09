@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from kofauth_common import ConfigurationError, EventListener, KoFAuthApi, Settings
+from kofauth_common import ConfigurationError, KoFAuthApi, OutboxListener, Settings
 
-from .bot import DiscordBot, register_event_handlers
+from .bot import DiscordBot, register_message_handlers
 
 LOGGER = logging.getLogger("kofauth.discord")
 
@@ -27,8 +27,8 @@ async def main() -> int:
         return 1
 
     bot = DiscordBot(settings, api)
-    listener = EventListener(settings.redis)
-    register_event_handlers(bot, listener)
+    listener = OutboxListener(api, settings.outbox("DISCORD"))
+    register_message_handlers(bot, listener)
 
     await listener.start()
     try:

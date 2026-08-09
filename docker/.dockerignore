@@ -1,9 +1,0 @@
-target/
-*/target/
-.git/
-.idea/
-docker/config/
-docker/.env
-*.log
-run/
-node_modules/

@@ -1,165 +1,208 @@
-"""Подписка на события KoFAuth через Redis.
+"""Получение сообщений KoFAuth ботами.
 
-Core рассылает доменные события в общий канал (``RedisEventBridge``). Боты
-слушают тот же канал: так уведомление о входе доходит до Telegram, даже если
-вход произошёл на другом узле сети.
+**Почему это больше не Redis.** Раньше боты подписывались на общий канал
+Pub/Sub тем же паролем, что и Core. Отсюда следовали две беды, каждой из
+которых хватило бы по отдельности.
 
-Событие приходит плоским набором строковых атрибутов — таков формат
-``RemoteEvent``. Здесь он превращается в обычный объект, а разбор ошибок
-намеренно снисходителен: неизвестное поле или новый тип события не должны
-останавливать подписку, иначе выпуск новой версии Core глушил бы ботов.
+Первая — полномочия. Пароль Redis не делится на «читать канал» и «всё
+остальное»: процесс на Python получал право читать и переписывать любые
+ключи — состояния входа, привязки UUID к сессиям, счётчики ограничения
+скорости — и публиковать любые доменные события от имени системы.
+
+Вторая — доставка. Pub/Sub не помнит сообщений. Бот, перезапущенный на две
+секунды, терял все запросы подтверждения, пришедшие за это время: игрок в
+Minecraft ждал кнопку, которой уже не будет, до самого таймаута.
+
+Здесь бот ходит в ``/api/bot/events`` со своим ключом и получает ровно то,
+что ему адресовано. Очередь живёт в базе, курсор — на сервере, поэтому
+короткий простой ничего не теряет: сообщения дождутся возвращения.
+
+Доставка — «не меньше одного раза». Бот может упасть между обработкой и
+подтверждением, поэтому одно и то же сообщение он обязан выдержать дважды.
+Для запроса подтверждения это безопасно: решение принимается атомарно на
+стороне сервера, а повторно показанная кнопка ведёт к тому же запросу.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-import redis.asyncio as redis
-
-from .config import RedisSettings
+from .api import ApiUnavailable, KoFAuthApi
+from .config import OutboxSettings
 
 LOGGER = logging.getLogger(__name__)
 
-Handler = Callable[["Event"], Awaitable[None]]
+Handler = Callable[["BotMessage"], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
-class Event:
-    """Событие KoFAuth.
+class BotMessage:
+    """Сообщение из очереди.
 
-    :param type: короткое имя класса события, например ``AccountLoginEvent``
-    :param account_id: аккаунт, которого событие касается
-    :param attributes: остальные поля как строки
+    :param id: номер сообщения; он же курсор доставки
+    :param kind: что нужно сделать — ``LOGIN_APPROVAL``, ``LOGIN_NOTICE`` и т.д.
+    :param recipient_id: кому адресовано в мессенджере
+    :param chat_id: куда писать; у Discord совпадает с ``recipient_id``
+    :param payload: скалярные поля; секретов здесь нет по построению
     """
 
-    type: str
-    account_id: int | None
-    attributes: dict[str, str] = field(default_factory=dict)
+    id: int
+    kind: str
+    recipient_id: int
+    chat_id: int
+    payload: dict[str, str] = field(default_factory=dict)
 
     def get(self, name: str, default: str = "") -> str:
-        return self.attributes.get(name, default)
-
-    def get_bool(self, name: str) -> bool:
-        return self.get(name).lower() in {"1", "true", "yes"}
+        value = self.payload.get(name)
+        return default if value is None else str(value)
 
     @staticmethod
-    def parse(raw: str) -> "Event | None":
-        try:
-            payload = json.loads(raw)
-        except ValueError:
-            LOGGER.warning("Событие не разобрано как JSON: %s", raw[:200])
-            return None
-        if not isinstance(payload, dict):
-            return None
+    def parse(raw: Any) -> BotMessage | None:
+        """Разбор одного элемента ответа.
 
-        event_type = str(payload.get("type") or payload.get("eventType") or "")
-        if not event_type:
+        Разбор снисходителен намеренно: неизвестное поле или новый вид
+        сообщения не должны останавливать чтение очереди, иначе выпуск новой
+        версии Core заглушил бы ботов целиком.
+        """
+        if not isinstance(raw, dict):
             return None
-        # В канал попадает короткое имя класса; полное с пакетом читается хуже
-        # и ничего не добавляет.
-        event_type = event_type.rsplit(".", 1)[-1]
-
-        account_id = payload.get("accountId")
         try:
-            account = int(account_id) if account_id is not None else None
+            message_id = int(raw.get("id"))
         except (TypeError, ValueError):
-            account = None
+            return None
 
-        attributes: dict[str, str] = {}
-        for key, value in payload.items():
-            if key in {"type", "eventType", "accountId"}:
-                continue
-            attributes[key] = "" if value is None else str(value)
-        # Часть отправителей кладёт поля во вложенный объект.
-        nested = payload.get("attributes")
-        if isinstance(nested, dict):
-            for key, value in nested.items():
-                attributes[key] = "" if value is None else str(value)
+        kind = str(raw.get("kind") or "")
+        if not kind:
+            return None
 
-        return Event(type=event_type, account_id=account, attributes=attributes)
+        payload = raw.get("payload")
+        fields: dict[str, str] = {}
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                fields[str(key)] = "" if value is None else str(value)
+
+        return BotMessage(
+            id=message_id,
+            kind=kind,
+            recipient_id=_as_int(raw.get("recipientId")),
+            chat_id=_as_int(raw.get("chatId")),
+            payload=fields,
+        )
 
 
-class EventListener:
-    """Читает канал событий и раздаёт их подписчикам."""
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
-    def __init__(self, settings: RedisSettings) -> None:
+
+class OutboxListener:
+    """Читает очередь сообщений и раздаёт их обработчикам."""
+
+    def __init__(self, api: KoFAuthApi, settings: OutboxSettings) -> None:
+        self._api = api
         self._settings = settings
         self._handlers: dict[str, list[Handler]] = {}
         self._task: asyncio.Task[None] | None = None
-        self._client: redis.Redis | None = None
 
-    def on(self, event_type: str, handler: Handler) -> None:
-        """Подписывает обработчик на тип события."""
-        self._handlers.setdefault(event_type, []).append(handler)
+    def on(self, kind: str, handler: Handler) -> None:
+        """Подписывает обработчик на вид сообщения."""
+        self._handlers.setdefault(kind, []).append(handler)
 
     async def start(self) -> None:
         if not self._settings.enabled:
-            LOGGER.info("Подписка на события выключена, уведомления не придут")
+            LOGGER.info("Чтение очереди выключено: подтверждения и уведомления не придут")
             return
-        self._task = asyncio.create_task(self._run(), name="kofauth-events")
+        self._task = asyncio.create_task(self._run(), name="kofauth-outbox")
 
     async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        if self._task is None:
+            return
+        self._task.cancel()
+        # Отмена собственной задачи — не ошибка, а способ её остановить:
+        # исключение здесь ожидаемо и означает, что цикл действительно завершён.
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._task
+        self._task = None
 
     async def _run(self) -> None:
-        """Читает канал, восстанавливая соединение после разрыва.
+        """Опрашивает очередь, переживая недоступность API.
 
-        Отказ Redis — не повод останавливать бота: команды продолжают работать
-        через REST, теряются только уведомления. Поэтому цикл переподключается
-        с паузой, а не завершается.
+        Пауза растёт при отказах и сбрасывается при первом успехе: постоянный
+        опрос лежащего сервиса не ускорит его возвращение, а после долгого
+        простоя бот не должен ждать минутами.
         """
-        delay = 1.0
+        delay = self._settings.poll_interval
         while True:
             try:
-                await self._consume()
-                delay = 1.0
+                delivered = await self.poll_once()
+                # Пока сообщения идут потоком, паузу не держим: очередь могла
+                # накопиться за время простоя, и разбирать её по одному
+                # интервалу значило бы растянуть доставку на минуты.
+                delay = self._settings.poll_interval
+                if delivered == 0:
+                    await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001 — причина не влияет на действие
+            except ApiUnavailable as exc:
                 LOGGER.warning(
-                    "Подписка на события прервана (%s), повтор через %.0f с", exc, delay
+                    "Очередь недоступна (%s), повтор через %.0f с", exc, delay
                 )
                 await asyncio.sleep(delay)
-                # Потолок нужен, чтобы после долгого простоя Redis бот
-                # не ждал часами.
-                delay = min(delay * 2, 30.0)
+                delay = min(delay * 2, self._settings.max_backoff)
+            except Exception:  # noqa: BLE001 — причина не влияет на действие
+                LOGGER.exception("Ошибка при чтении очереди")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self._settings.max_backoff)
 
-    async def _consume(self) -> None:
-        self._client = redis.from_url(self._settings.url, decode_responses=True)
-        pubsub = self._client.pubsub(ignore_subscribe_messages=True)
-        await pubsub.subscribe(self._settings.channel)
-        LOGGER.info("Подписка на канал %s установлена", self._settings.channel)
+    async def poll_once(self) -> int:
+        """Один цикл: прочитать, раздать, подтвердить.
 
-        async for message in pubsub.listen():
-            if message.get("type") != "message":
+        :return: сколько сообщений обработано
+
+        Подтверждение отправляется только после того, как все сообщения пачки
+        розданы. Упасть между раздачей и подтверждением можно — тогда пачка
+        придёт снова, и это лучше, чем потерять её молча.
+        """
+        result = await self._api.events(self._settings.platform, self._settings.batch_size)
+        if not result.ok:
+            LOGGER.warning("Очередь ответила отказом: %s", result.error)
+            return 0
+
+        raw_messages = result.data.get("messages") or []
+        if not raw_messages:
+            return 0
+
+        highest = 0
+        handled = 0
+        for raw in raw_messages:
+            message = BotMessage.parse(raw)
+            if message is None:
                 continue
-            await self._dispatch(str(message.get("data", "")))
+            highest = max(highest, message.id)
+            handled += 1
+            await self._dispatch(message)
 
-    async def _dispatch(self, raw: str) -> None:
-        event = Event.parse(raw)
-        if event is None:
-            return
-        for handler in self._handlers.get(event.type, ()):
+        if highest:
+            await self._api.ack(self._settings.platform, highest)
+        return handled
+
+    async def _dispatch(self, message: BotMessage) -> None:
+        for handler in self._handlers.get(message.kind, ()):
             try:
-                await handler(event)
+                await handler(message)
             except Exception:  # noqa: BLE001 — один обработчик не глушит остальные
-                LOGGER.exception("Обработчик события %s упал", event.type)
+                LOGGER.exception("Обработчик сообщения %s упал", message.kind)
 
 
-def payload_to_json(data: dict[str, Any]) -> str:
-    """Сериализация для тестов и отладки."""
-    return json.dumps(data, ensure_ascii=False)
+# Виды сообщений. Строки совпадают с BotMessage.Kind на стороне Core.
+LOGIN_APPROVAL = "LOGIN_APPROVAL"
+LOGIN_APPROVAL_RESOLVED = "LOGIN_APPROVAL_RESOLVED"
+LOGIN_NOTICE = "LOGIN_NOTICE"
+SECURITY_NOTICE = "SECURITY_NOTICE"

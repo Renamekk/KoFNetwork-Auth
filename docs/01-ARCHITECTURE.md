@@ -72,8 +72,8 @@ graph TB
 
     subgraph "Service Layer"
         API["KoFAuth-WebAPI<br/>Spring Boot"]
-        TGB["KoFAuth-Telegram"]
-        DCB["KoFAuth-Discord"]
+        TGB["telegram_bot (Python)"]
+        DCB["discord_bot (Python)"]
     end
 
     subgraph "Data Layer"
@@ -118,8 +118,8 @@ graph LR
     VEL[KoFAuth-Velocity]
     PAP[KoFAuth-Paper]
     WEB[KoFAuth-WebAPI]
-    TGM[KoFAuth-Telegram]
-    DIS[KoFAuth-Discord]
+    TGM[telegram_bot]
+    DIS[discord_bot]
     SITE[KoFAuth-Website<br/>статика]
 
     CORE --> API
@@ -138,8 +138,8 @@ graph LR
 | KoFAuth-Velocity | `kofauth-velocity` | shaded jar | Плагин прокси: маршрутизация в Limbo, блокировка pre-login трафика, перевод на лобби |
 | KoFAuth-Paper | `kofauth-paper` | shaded jar | Плагин Paper: Limbo-мир, защитные слушатели, CAPTCHA GUI, команды |
 | KoFAuth-WebAPI | `kofauth-webapi` | executable jar | REST API + Swagger + раздача сайта |
-| KoFAuth-Telegram | `kofauth-telegram` | executable jar | Telegram-бот |
-| KoFAuth-Discord | `kofauth-discord` | executable jar | Discord-бот |
+| bots/apps/telegram_bot | `kofauth-telegram-bot` | образ Python | Telegram-бот |
+| bots/apps/discord_bot | `kofauth-discord-bot` | образ Python | Discord-бот |
 | KoFAuth-Website | — | статика | Личный кабинет (HTML/CSS/JS) |
 
 ---
@@ -364,7 +364,7 @@ net.kofnetwork.auth.velocity          net.kofnetwork.auth.paper
 ├── session/                          │   ├── InteractionListener.java
 │   └── ProxySessionTracker.java      │   └── VisibilityListener.java
 ├── limbo/                            ├── captcha/
-│   └── LimboRouter.java              │   ├── GuiCaptchaRenderer.java
+│   ├── ServerPool.java               │   ├── GuiCaptchaRenderer.java
 ├── command/                          │   ├── ChatCaptchaRenderer.java
 │   ├── LoginCommand.java             │   └── MapCaptchaRenderer.java
 │   ├── RegisterCommand.java          ├── command/
@@ -425,7 +425,7 @@ sequenceDiagram
     participant P as Игрок (Limbo)
     participant C as Core
     participant R as Redis
-    participant T as KoFAuth-Telegram
+    participant T as telegram_bot
     participant U as Telegram-клиент
 
     P->>C: /login <пароль> (пароль верный)
@@ -578,4 +578,5 @@ mvn clean install -DskipTests
 - `KoFAuth-Velocity/target/KoFAuth-Velocity-1.0.0-SNAPSHOT.jar` → `velocity/plugins/`
 - `KoFAuth-Paper/target/KoFAuth-Paper-1.0.0-SNAPSHOT.jar` → `paper/plugins/`
 - `KoFAuth-WebAPI/target/KoFAuth-WebAPI-1.0.0-SNAPSHOT.jar` → `java -jar`
-- `KoFAuth-Telegram/target/...`, `KoFAuth-Discord/target/...` → `java -jar`
+- боты собираются отдельно: `bots/docker/Dockerfile`, один образ на обоих
+  (`python -m telegram_bot` / `python -m discord_bot`)

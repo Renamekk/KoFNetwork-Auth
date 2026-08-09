@@ -61,7 +61,14 @@ public final class SecurityServiceImpl implements SecurityService {
         Limit limit = limitFor(scope);
         // Проверка и учёт одной операцией: раздельные дают окно, в котором
         // параллельные запросы проходят проверку до того, как хоть один засчитан.
-        return cache.incrementSlidingWindow(CacheProvider.Keys.rateLimit(scope, key), limit.window())
+        //
+        // Операция строгая. Прежде отказ хранилища подменялся единицей — «одно
+        // событие, лимит не исчерпан», — и ограничение скорости бесшумно выключалось
+        // ровно в тот момент, когда оно нужнее всего: при отказе инфраструктуры,
+        // которым обычно и сопровождается атака. Теперь отказ виден, и вызывающий
+        // отвечает «попробуйте позже» вместо того, чтобы пропустить перебор.
+        return cache.critical()
+                .incrementSlidingWindow(CacheProvider.Keys.rateLimit(scope, key), limit.window())
                 .thenApply(count -> verdict(count, limit));
     }
 

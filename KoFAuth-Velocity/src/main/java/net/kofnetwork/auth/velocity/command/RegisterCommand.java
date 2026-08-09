@@ -3,34 +3,35 @@ package net.kofnetwork.auth.velocity.command;
 import com.velocitypowered.api.command.CommandSource;
 import com.velocitypowered.api.command.SimpleCommand;
 import com.velocitypowered.api.proxy.Player;
-import com.velocitypowered.api.proxy.server.RegisteredServer;
 import net.kofnetwork.auth.api.dto.AuthContext;
 import net.kofnetwork.auth.api.dto.RegistrationRequest;
 import net.kofnetwork.auth.api.model.AuthState;
 import net.kofnetwork.auth.api.model.IpAddress;
 import net.kofnetwork.auth.api.result.RegistrationResult;
 import net.kofnetwork.auth.core.KoFAuthCore;
-import net.kofnetwork.auth.velocity.limbo.LimboRouter;
+import net.kofnetwork.auth.velocity.limbo.PlayerTransfer;
+import net.kofnetwork.auth.velocity.listener.PendingLogins;
 import net.kofnetwork.auth.velocity.message.MessageService;
 import org.slf4j.Logger;
 
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 /** Команда {@code /register <пароль> <пароль>}. */
 public final class RegisterCommand implements SimpleCommand {
 
     private final KoFAuthCore core;
-    private final LimboRouter router;
+    private final PlayerTransfer transfer;
     private final MessageService messages;
+    private final PendingLogins pendingLogins;
     private final Logger logger;
 
-    public RegisterCommand(KoFAuthCore core, LimboRouter router,
-                           MessageService messages, Logger logger) {
+    public RegisterCommand(KoFAuthCore core, PlayerTransfer transfer, MessageService messages,
+                           PendingLogins pendingLogins, Logger logger) {
         this.core = core;
-        this.router = router;
+        this.transfer = transfer;
         this.messages = messages;
+        this.pendingLogins = pendingLogins;
         this.logger = logger;
     }
 
@@ -160,16 +161,30 @@ public final class RegisterCommand implements SimpleCommand {
      * остаётся только перевести состояние и отправить игрока в лобби.
      */
     private void onSuccess(Player player, RegistrationResult result) {
+        // Отметка ставится до перевода: перевод занимает время, и без неё
+        // только что зарегистрировавшийся игрок попадал под отключение
+        // по таймауту входа.
+        pendingLogins.completed(player.getUniqueId());
+
         core.sessions().resetState(player.getUniqueId(), AuthState.AUTHENTICATED)
-                .thenRun(() -> {
+                .whenComplete((ignored, failure) -> {
+                    if (failure != null) {
+                        logger.error("Регистрация игрока {} прошла, но состояние не записано",
+                                player.getUsername(), failure);
+                        player.disconnect(messages.kick("unavailable",
+                                "<red>Сервер авторизации недоступен. Подключитесь заново."));
+                        return;
+                    }
                     player.sendMessage(messages.prefixed("register-success",
                             "<green>Аккаунт создан. Не забудьте привязать почту."));
-                    Optional<RegisteredServer> lobby = router.selectLobby();
-                    if (lobby.isPresent()) {
-                        player.createConnectionRequest(lobby.get()).fireAndForget();
-                    } else {
-                        logger.error("Нет доступного лобби для игрока {}", player.getUsername());
-                    }
+                    transfer.toHub(player).thenAccept(outcome -> {
+                        if (!outcome.success()) {
+                            logger.error("Игрока {} не удалось перевести на хаб: {}",
+                                    player.getUsername(), outcome.detail());
+                            player.sendMessage(messages.prefixed("hub-unavailable",
+                                    "<red>Хаб недоступен. Сообщите администрации."));
+                        }
+                    });
                 });
     }
 

@@ -23,6 +23,7 @@ import net.kofnetwork.auth.api.model.TelegramBinding;
 import net.kofnetwork.auth.api.model.TokenType;
 import net.kofnetwork.auth.api.model.TotpSecret;
 import net.kofnetwork.auth.api.model.TwoFactorMethod;
+import net.kofnetwork.auth.api.repository.TokenRepository;
 import net.kofnetwork.auth.core.concurrent.AsyncExecutors;
 import net.kofnetwork.auth.core.config.YamlConfigurationService;
 import net.kofnetwork.auth.core.database.DatabaseManager;
@@ -434,6 +435,63 @@ class JdbcRepositoriesIT {
                 .toList();
 
         assertThat(results.stream().filter(Boolean::booleanValue)).hasSize(1);
+    }
+
+    @Test
+    void погашение_по_хэшу_атомарно_под_параллельной_нагрузкой() {
+        // Регрессия на TOCTOU. Раньше сервис читал строку, убеждался, что токен
+        // не использован, не отозван и не истёк, и только потом помечал его.
+        // Между чтением и пометкой помещался второй запрос с тем же кодом: он
+        // видел ту же пригодную строку и тоже шёл дальше. Теперь всё условие
+        // живёт в WHERE одного UPDATE.
+        long accountId = persist("Steve");
+        tokens.insert(AuthToken.issue(accountId, TokenType.PASSWORD_RESET,
+                "f".repeat(64), null)).join();
+
+        List<TokenRepository.ConsumeOutcome> results = IntStream.range(0, 30).parallel()
+                .mapToObj(i -> tokens.consumeByHash("f".repeat(64), TokenType.PASSWORD_RESET,
+                        Instant.now(), null).join())
+                .toList();
+
+        assertThat(results.stream().filter(TokenRepository.ConsumeOutcome::isConsumed))
+                .as("выиграть обязан ровно один запрос")
+                .hasSize(1);
+        assertThat(results.stream()
+                .filter(outcome -> outcome.status() == TokenRepository.ConsumeStatus.ALREADY_USED))
+                .as("остальные обязаны узнать, что токен уже использован")
+                .hasSize(29);
+    }
+
+    @Test
+    void погашение_различает_причины_отказа() {
+        long accountId = persist("Steve");
+
+        // Токена нет вовсе.
+        assertThat(tokens.consumeByHash("0".repeat(64), TokenType.PASSWORD_RESET,
+                        Instant.now(), null).join().status())
+                .isEqualTo(TokenRepository.ConsumeStatus.NOT_FOUND);
+
+        // Тип не тот: код привязки Telegram не может сбросить пароль.
+        tokens.insert(AuthToken.issue(accountId, TokenType.TELEGRAM_LINK,
+                "6".repeat(64), null)).join();
+        assertThat(tokens.consumeByHash("6".repeat(64), TokenType.PASSWORD_RESET,
+                        Instant.now(), null).join().status())
+                .isEqualTo(TokenRepository.ConsumeStatus.WRONG_TYPE);
+
+        // Срок истёк.
+        tokens.insert(AuthToken.issue(accountId, TokenType.PASSWORD_RESET, "7".repeat(64), null)
+                .withExpiry(Instant.now().minusSeconds(60))).join();
+        assertThat(tokens.consumeByHash("7".repeat(64), TokenType.PASSWORD_RESET,
+                        Instant.now(), null).join().status())
+                .isEqualTo(TokenRepository.ConsumeStatus.EXPIRED);
+
+        // Токен отозван.
+        AuthToken revoked = tokens.insert(AuthToken.issue(accountId, TokenType.PASSWORD_RESET,
+                "8".repeat(64), null)).join();
+        tokens.revoke(revoked.id(), Instant.now()).join();
+        assertThat(tokens.consumeByHash("8".repeat(64), TokenType.PASSWORD_RESET,
+                        Instant.now(), null).join().status())
+                .isEqualTo(TokenRepository.ConsumeStatus.REVOKED);
     }
 
     @Test

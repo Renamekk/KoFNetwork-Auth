@@ -62,6 +62,54 @@ class SessionStateTest {
             ttls.remove(key);
             return CompletableFuture.completedFuture(values.remove(key) != null);
         }
+
+        /**
+         * Строгие операции ведут себя как обычные: этот двойник исправен.
+         *
+         * <p>База {@link NoopCacheProvider} отвергает строгие вызовы — она изображает
+         * отсутствующее хранилище. Здесь хранилище есть, просто в памяти теста, и
+         * отказывать ему не в чем.
+         */
+        @Override
+        public @NotNull Critical critical() {
+            return new Critical() {
+
+                @Override
+                public @NotNull CompletableFuture<Optional<String>> get(@NotNull String key) {
+                    return RecordingCache.this.get(key);
+                }
+
+                @Override
+                public @NotNull CompletableFuture<Void> set(@NotNull String key,
+                                                            @NotNull String value,
+                                                            @NotNull Duration ttl) {
+                    return RecordingCache.this.set(key, value, ttl);
+                }
+
+                @Override
+                public @NotNull CompletableFuture<Boolean> delete(@NotNull String key) {
+                    return RecordingCache.this.delete(key);
+                }
+
+                @Override
+                public @NotNull CompletableFuture<Map<String, String>> getHash(@NotNull String key) {
+                    return RecordingCache.this.getHash(key);
+                }
+
+                @Override
+                public @NotNull CompletableFuture<Void> setHash(@NotNull String key,
+                                                                @NotNull Map<String, String> hash,
+                                                                @NotNull Duration ttl) {
+                    return RecordingCache.this.setHash(key, hash, ttl);
+                }
+
+                @Override
+                public @NotNull CompletableFuture<Long> incrementSlidingWindow(
+                        @NotNull String key, @NotNull Duration window) {
+                    return RecordingCache.this.incrementSlidingWindow(key, window);
+                }
+            };
+        }
     }
 
     private RecordingCache cache;

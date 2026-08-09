@@ -17,7 +17,6 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import discord
-
 from kofauth_common import ApiUnavailable, KoFAuthApi, texts
 
 LOGGER = logging.getLogger(__name__)
@@ -105,23 +104,6 @@ class MenuView(discord.ui.View):
         await self._screen(interaction, "Последние входы",
                            self._api.history(PLATFORM, self._user_id),
                            lambda data: texts.history_lines(data.get("history", [])))
-
-    @discord.ui.button(label="Код для входа", emoji="🔢", style=discord.ButtonStyle.success,
-                       row=1)
-    async def send_code(self, interaction: discord.Interaction,
-                        button: discord.ui.Button) -> None:
-        result = await self._fetch(interaction, self._api.send_code(PLATFORM, self._user_id))
-        if result is None:
-            return
-        code = result.get("code", "")
-        # Код уходит отдельным сообщением: его копируют, и он не должен
-        # исчезнуть при следующем шаге по меню.
-        await interaction.response.send_message(
-            f"🔑 Код подтверждения входа:\n```\n{code}\n```\n"
-            f"Введите в игре: `/login пароль {code}`\n"
-            f"Действует {int(result.get('expiresInSeconds', 120)) // 60} мин.",
-            ephemeral=True,
-        )
 
     # ------------------------------------------------------------------ общее
 
@@ -321,40 +303,79 @@ class HelpButton(discord.ui.Button):
 class ApprovalView(discord.ui.View):
     """Кнопки подтверждения входа.
 
-    Таймаут совпадает со сроком жизни токена: держать нажимаемыми кнопки,
-    за которыми уже нет действующего токена, — значит обещать несбыточное.
+    Ровно две и никаких кодов. Идентификатор запроса хранится в самом объекте
+    представления, но решение принимает сервер: он же и сверяет, что нажал тот,
+    кому кнопка адресована.
+
+    Проверка владельца выполняется дважды — здесь и на сервере. Здешняя
+    проверка нужна, чтобы человек сразу получил внятный ответ вместо отказа
+    без объяснений; серверная — потому что клиентской доверять нельзя, а
+    сообщение с кнопками можно переслать.
+
+    Таймаут совпадает со сроком жизни запроса: держать нажимаемыми кнопки,
+    за которыми уже нет действующего запроса, — значит обещать несбыточное.
     """
 
-    def __init__(self, api: KoFAuthApi, token: str, timeout: float = 120.0) -> None:
+    def __init__(self, api: KoFAuthApi, approval_id: str, recipient_id: int,
+                 timeout: float = 120.0) -> None:
         super().__init__(timeout=timeout)
         self._api = api
-        self._token = token
+        self._approval_id = approval_id
+        self._recipient_id = recipient_id
 
-    @discord.ui.button(label="Это я", emoji="✅", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Войти", emoji="✅", style=discord.ButtonStyle.success)
     async def approve(self, interaction: discord.Interaction,
                       button: discord.ui.Button) -> None:
         await self._decide(interaction, approved=True)
 
-    @discord.ui.button(label="Это не я", emoji="❌", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Отклонить", emoji="❌", style=discord.ButtonStyle.danger)
     async def deny(self, interaction: discord.Interaction,
                    button: discord.ui.Button) -> None:
         await self._decide(interaction, approved=False)
 
     async def _decide(self, interaction: discord.Interaction, approved: bool) -> None:
+        if interaction.user.id != self._recipient_id:
+            await interaction.response.send_message(
+                "Эта кнопка адресована другому человеку.", ephemeral=True
+            )
+            return
+
         try:
-            result = await self._api.approve(self._token, approved)
+            result = await self._api.approve(
+                PLATFORM, interaction.user.id, self._approval_id, approved
+            )
         except ApiUnavailable:
+            # Сообщение не правим: запрос, возможно, ещё жив, и человек сможет
+            # нажать снова.
             await interaction.response.send_message(texts.API_UNAVAILABLE, ephemeral=True)
             return
 
-        if not approved:
-            text = "Вход отклонён. Если это были не вы — смените пароль."
-        elif result.ok and result.data.get("ok"):
-            text = "Вход подтверждён."
-        else:
-            text = "Запрос устарел или уже обработан."
+        outcome = str(result.data.get("result") or "")
+        text = approval_outcome_text(outcome, approved)
 
-        # Кнопки убираем: токен погашен, нажимать больше нечего.
+        if outcome == "FOREIGN":
+            await interaction.response.send_message(text, ephemeral=True)
+            return
+
+        # Кнопки убираем: решение принято, нажимать больше нечего.
         await interaction.response.edit_message(
             embed=embed("Подтверждение входа", [text]), view=None
         )
+
+
+def approval_outcome_text(outcome: str, approved: bool) -> str:
+    """Человеческое описание исхода нажатия."""
+    if outcome == "APPLIED":
+        return (
+            "Вход подтверждён." if approved
+            else "Вход отклонён. Если это были не вы — смените пароль."
+        )
+    if outcome == "ALREADY_DECIDED":
+        return "Этот запрос уже обработан."
+    if outcome == "EXPIRED":
+        return "Время подтверждения истекло. Зайдите в игру ещё раз."
+    if outcome == "FOREIGN":
+        return "Эта кнопка адресована другому человеку."
+    if outcome == "NOT_FOUND":
+        return "Запрос не найден: возможно, он уже устарел."
+    return "Не получилось обработать нажатие."

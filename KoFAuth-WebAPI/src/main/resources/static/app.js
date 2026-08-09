@@ -118,14 +118,76 @@ const formatTime = (iso) => new Date(iso).toLocaleString('ru-RU', {
 
 // ------------------------------------------------------------------ вход
 
+let approvalPollTimer = null;
+
+function stopApprovalPolling() {
+    if (approvalPollTimer !== null) {
+        clearTimeout(approvalPollTimer);
+        approvalPollTimer = null;
+    }
+    $('approval-wait').classList.add('hidden');
+    $('form-login').querySelector('button[type="submit"]').disabled = false;
+}
+
+function approvalMessage(status) {
+    return {
+        denied: 'Вход отклонён в Telegram. Проверьте данные и попробуйте снова.',
+        expired: 'Подтверждение истекло. Введите логин и пароль ещё раз.'
+    }[status] || 'Не удалось подтвердить вход. Повторите попытку.';
+}
+
+async function pollApproval(attemptId, browserProof) {
+    try {
+        const status = await post('/auth/approval/status', { attemptId, browserProof });
+        if (status.ready) {
+            const pair = await post('/auth/approval/exchange', { attemptId, browserProof });
+            // Proof погашен сервером атомарно. Не сохраняем его в storage и не
+            // оставляем в URL: после обмена вкладке нужны только нормальные токены.
+            stopApprovalPolling();
+            store.save(pair);
+            await openAccount();
+            return;
+        }
+        if (status.status === 'pending' || status.status === 'approved') {
+            approvalPollTimer = setTimeout(() => pollApproval(attemptId, browserProof), 1500);
+            return;
+        }
+        stopApprovalPolling();
+        toast(approvalMessage(status.status), 'err');
+    } catch (e) {
+        // Кнопка могла быть нажата между status и exchange либо сеть кратко
+        // пропала. Для финального ответа не продолжаем выдачу: пользователь явно
+        // видит, что надо начать новую попытку, а повтор не получит вторую сессию.
+        stopApprovalPolling();
+        toast(e.message || 'Не удалось завершить вход. Повторите попытку.', 'err');
+    }
+}
+
+function beginBotApproval(result) {
+    const form = $('form-login');
+    form.querySelector('button[type="submit"]').disabled = true;
+    $('field-totp').classList.add('hidden');
+    form.elements.twoFactorCode.value = '';
+    $('approval-wait').textContent = 'Подтвердите вход кнопкой «Войти» в Telegram. Ожидаем подтверждение…';
+    $('approval-wait').classList.remove('hidden');
+    pollApproval(result.attemptId, result.browserProof);
+}
+
 $('form-login').addEventListener('submit', async (event) => {
     event.preventDefault();
     const data = formData(event.target);
     try {
         const result = await post('/auth/login', data);
         if (result.status === 'two_factor_required') {
-            $('field-totp').classList.remove('hidden');
-            toast('Введите код подтверждения (' + result.method + ')');
+            if (result.method === 'TOTP') {
+                stopApprovalPolling();
+                $('field-totp').classList.remove('hidden');
+                toast('Введите код из приложения аутентификации');
+            } else if (result.attemptId && result.browserProof) {
+                beginBotApproval(result);
+            } else {
+                toast('Подтверждение входа недоступно. Повторите попытку.', 'err');
+            }
             return;
         }
         store.save(result);
@@ -266,8 +328,8 @@ $('to-register').addEventListener('click', (e) => {
     show('view-register');
     loadCaptcha();
 });
-$('to-login').addEventListener('click', (e) => { e.preventDefault(); showLogin(); });
-$('to-login-2').addEventListener('click', (e) => { e.preventDefault(); showLogin(); });
+$('to-login').addEventListener('click', (e) => { e.preventDefault(); stopApprovalPolling(); showLogin(); });
+$('to-login-2').addEventListener('click', (e) => { e.preventDefault(); stopApprovalPolling(); showLogin(); });
 $('to-forgot').addEventListener('click', (e) => { e.preventDefault(); show('view-forgot'); });
 
 $('logout').addEventListener('click', async () => {

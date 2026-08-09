@@ -10,6 +10,7 @@ import io.lettuce.core.pubsub.RedisPubSubAdapter;
 import io.lettuce.core.pubsub.StatefulRedisPubSubConnection;
 import net.kofnetwork.auth.api.config.ConfigFile;
 import net.kofnetwork.auth.api.config.ConfigurationService;
+import net.kofnetwork.auth.api.exception.CacheUnavailableException;
 import net.kofnetwork.auth.api.exception.ConfigurationException;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
@@ -152,6 +153,96 @@ public final class RedisCacheProvider implements CacheProvider {
                     description, e.getMessage());
             return CompletableFuture.completedFuture(fallback);
         }
+    }
+
+    /**
+     * Выполняет операцию, не пряча отказ Redis.
+     *
+     * <p>Зеркало {@link #guarded}: там отказ подменяется значением по умолчанию, здесь
+     * поднимается вызывающему. Разница нужна потому, что «ключа нет» и «сервер не
+     * ответил» — разные события для состояния входа, привязок и счётчиков лимитов,
+     * у которых нет копии в MySQL.
+     */
+    private <T> CompletableFuture<T> strict(Supplier<CompletableFuture<T>> operation,
+                                            String description) {
+        if (closed.get()) {
+            return CompletableFuture.failedFuture(new CacheUnavailableException(
+                    "Соединение с Redis закрыто (" + description + ")"));
+        }
+        try {
+            return operation.get().handle((value, failure) -> {
+                if (failure == null) {
+                    return CompletableFuture.completedFuture(value);
+                }
+                LOGGER.error("Redis не ответил на критичную операцию '{}': {}",
+                        description, failure.toString());
+                return CompletableFuture.<T>failedFuture(new CacheUnavailableException(
+                        "Redis недоступен: " + description, failure));
+            }).thenCompose(java.util.function.Function.identity());
+        } catch (RuntimeException e) {
+            LOGGER.error("Redis не ответил на критичную операцию '{}': {}", description, e.toString());
+            return CompletableFuture.failedFuture(new CacheUnavailableException(
+                    "Redis недоступен: " + description, e));
+        }
+    }
+
+    @Override
+    public @NotNull Critical critical() {
+        return new Critical() {
+
+            @Override
+            public @NotNull CompletableFuture<Optional<String>> get(@NotNull String key) {
+                return strict(() -> commands.get(key(key)).toCompletableFuture()
+                        .thenApply(Optional::ofNullable), "get " + key);
+            }
+
+            @Override
+            public @NotNull CompletableFuture<Void> set(@NotNull String key,
+                                                        @NotNull String value,
+                                                        @NotNull Duration ttl) {
+                return strict(() -> commands.psetex(key(key), ttl.toMillis(), value)
+                        .toCompletableFuture().thenApply(ignored -> (Void) null), "set " + key);
+            }
+
+            @Override
+            public @NotNull CompletableFuture<Boolean> delete(@NotNull String key) {
+                return strict(() -> commands.del(key(key)).toCompletableFuture()
+                        .thenApply(count -> count > 0), "delete " + key);
+            }
+
+            @Override
+            public @NotNull CompletableFuture<Map<String, String>> getHash(@NotNull String key) {
+                return strict(() -> commands.hgetall(key(key)).toCompletableFuture()
+                        .thenApply(map -> map == null ? Map.<String, String>of() : map),
+                        "getHash " + key);
+            }
+
+            @Override
+            public @NotNull CompletableFuture<Void> setHash(@NotNull String key,
+                                                            @NotNull Map<String, String> values,
+                                                            @NotNull Duration ttl) {
+                if (values.isEmpty()) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                String prefixed = key(key);
+                return strict(() -> commands.hset(prefixed, values).toCompletableFuture()
+                                .thenCompose(ignored -> commands.pexpire(prefixed, ttl.toMillis())
+                                        .toCompletableFuture())
+                                .thenApply(ignored -> (Void) null),
+                        "setHash " + key);
+            }
+
+            @Override
+            public @NotNull CompletableFuture<Long> incrementSlidingWindow(@NotNull String key,
+                                                                            @NotNull Duration window) {
+                long now = System.currentTimeMillis();
+                String member = now + "-" + UUID.randomUUID();
+                return strict(() -> commands.<Long>eval(SLIDING_WINDOW_ADD,
+                                ScriptOutputType.INTEGER, new String[]{key(key)},
+                                String.valueOf(now), String.valueOf(window.toMillis()), member)
+                        .toCompletableFuture(), "slidingWindow " + key);
+            }
+        };
     }
 
     // ------------------------------------------------------------------ строки

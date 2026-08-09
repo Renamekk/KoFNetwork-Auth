@@ -19,8 +19,7 @@ REST API, Telegram- и Discord-боты, TOTP, личный кабинет.
 | [`KoFAuth-Velocity`](KoFAuth-Velocity) | Плагин прокси: маршрутизация в Limbo, блокировка pre-login трафика |
 | [`KoFAuth-Paper`](KoFAuth-Paper) | Плагин Paper: Limbo-мир, защита, CAPTCHA GUI, команды |
 | [`KoFAuth-WebAPI`](KoFAuth-WebAPI) | Spring Boot REST API + Swagger + раздача сайта |
-| [`KoFAuth-Telegram`](KoFAuth-Telegram) | Telegram-бот: привязка, вход в одно нажатие, уведомления |
-| [`KoFAuth-Discord`](KoFAuth-Discord) | Discord-бот: slash-команды, OAuth2 |
+| [`bots/`](bots) | Боты Telegram и Discord на Python: привязка, подтверждение входа кнопкой, уведомления |
 | `KoFAuth-Website` | Личный кабинет (статика, раздаётся WebAPI) |
 
 ## Установка на сервер
@@ -93,7 +92,7 @@ MySQL 8 и Redis 7 через Testcontainers, поэтому нужен запу
 - [x] Этап 8 — Авторизация — блокировки, 2FA, перехэширование, постоянное время ответа
 - [x] Этап 9 — CAPTCHA — GUI-сетка и текстовый режим, выдача при входе и при подозрительной активности
 - [x] Этап 10 — Email — `/email`, восстановление пароля по коду, уведомления о входе
-- [x] Этап 11 — Telegram — бот, привязка, подтверждение кнопкой, `/sendcode`, уведомления
+- [x] Этап 11 — Telegram — бот, привязка, подтверждение кнопкой, уведомления
 - [x] Этап 12 — Discord — slash-команды, подтверждение кнопкой, OAuth2, уведомления в личку
 - [x] Этап 13 — Website — личный кабинет без зависимостей, раздаётся WebAPI
 - [x] Этап 14 — REST API — 31 эндпоинт, JWT, Swagger, rate-limit, CSRF, CSP

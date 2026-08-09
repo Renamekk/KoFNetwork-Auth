@@ -5,7 +5,12 @@
 нику — достаточно было бы знать ник.
 
 Бот тонкий: он не знает ни паролей, ни устройства базы. Всё, что он делает,
-проходит через ``/api/bot``, а уведомления приходят из общего канала событий.
+проходит через ``/api/bot``; оттуда же он читает очередь сообщений.
+
+Подтверждение входа — это две кнопки и ничего больше. Кодов бот не выдаёт и
+вводить в Minecraft ничего не просит: код был предъявительским, его можно было
+получить без всякой попытки входа и предъявить когда угодно, а проверить, тот
+ли человек его предъявил, было нечем.
 """
 
 from __future__ import annotations
@@ -16,12 +21,18 @@ from typing import Any
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, Message
-from aiogram.exceptions import TelegramBadRequest
-
-from kofauth_common import ApiUnavailable, Event, EventListener, KoFAuthApi, Settings
-from kofauth_common import texts
+from kofauth_common import (
+    ApiUnavailable,
+    BotMessage,
+    KoFAuthApi,
+    OutboxListener,
+    Settings,
+    texts,
+)
+from kofauth_common import events as event_kinds
 
 from . import menu
 
@@ -72,7 +83,6 @@ class TelegramBot:
         router.message.register(self._on_devices, Command("devices"))
         router.message.register(self._on_history, Command("history"))
         router.message.register(self._on_security, Command("security"))
-        router.message.register(self._on_sendcode, Command("sendcode"))
         router.message.register(self._on_unlink, Command("unlink"))
         router.message.register(self._on_help, Command("help"))
         router.message.register(self._on_login_hint, Command("login"))
@@ -169,25 +179,6 @@ class TelegramBot:
                 reply_markup=menu.security_menu(bool(profile.get("loginApproval"))),
             )
 
-    async def _on_sendcode(self, message: Message) -> None:
-        result = await self._call(message, self._api.send_code(PLATFORM, message.from_user.id))
-        if result is None:
-            return
-        if not result.ok:
-            await message.answer("❌ " + texts.describe_error(result.error))
-            return
-        await message.answer(self._code_text(result.data), parse_mode=ParseMode.HTML)
-
-    @staticmethod
-    def _code_text(data: dict[str, Any]) -> str:
-        code = esc(data.get("code", ""))
-        seconds = int(data.get("expiresInSeconds", 120) or 120)
-        return (
-            f"🔑 Код подтверждения входа:\n\n<code>{code}</code>\n\n"
-            f"Введите в игре: <code>/login пароль {code}</code>\n"
-            f"Действует {seconds // 60} мин и срабатывает один раз."
-        )
-
     async def _on_unlink(self, message: Message) -> None:
         await message.answer(
             "Отвязать Telegram? Подтверждение входа и уведомления перестанут работать.",
@@ -213,15 +204,16 @@ class TelegramBot:
             "/security — защита и подтверждение входа\n"
             "/devices — устройства\n"
             "/history — история входов\n"
-            "/sendcode — код для ручного ввода в игре\n"
             "/unlink — отвязать Telegram\n\n"
             f"Личный кабинет: {esc(self._settings.panel_url)}"
         )
 
     async def _on_login_hint(self, message: Message) -> None:
         await message.answer(
-            "Подтверждение входа приходит сюда само, когда вы заходите в игру.\n\n"
-            "Если сообщение с кнопками не пришло — возьмите код командой /sendcode."
+            "Подтверждение входа приходит сюда само, когда вы заходите в игру: "
+            "две кнопки, «Войти» и «Отклонить».\n\n"
+            "Вводить в игре ничего не нужно. Если сообщение не пришло — "
+            "повторите вход в Minecraft, запрос придёт заново."
         )
 
     # ------------------------------------------------------------------ меню
@@ -272,18 +264,6 @@ class TelegramBot:
         action = query.data.split(":", 1)[1]
         user_id = query.from_user.id
 
-        if action == "sendcode":
-            result = await self._api.send_code(PLATFORM, user_id)
-            # Код уходит отдельным сообщением, а не правкой экрана: его копируют,
-            # и он не должен исчезнуть при следующем шаге по меню.
-            await query.message.answer(
-                self._code_text(result.data) if result.ok
-                else "❌ " + texts.describe_error(result.error),
-                parse_mode=ParseMode.HTML,
-            )
-            await query.answer()
-            return
-
         if action in {"approval:on", "approval:off"}:
             enabled = action.endswith(":on")
             result = await self._api.set_login_approval(PLATFORM, user_id, enabled)
@@ -323,36 +303,71 @@ class TelegramBot:
     # ------------------------------------------------------------------ подтверждение входа
 
     async def _on_approval(self, query: CallbackQuery) -> None:
+        """Нажатие кнопки подтверждения.
+
+        Решение принимает сервер. Бот не проверяет ни срок, ни владельца сам:
+        обе проверки обязаны выполняться там же, где записывается результат,
+        иначе между проверкой и записью помещается второе нажатие.
+
+        Идентификатор нажавшего берётся из данных Telegram, а не из сообщения:
+        подставить чужой человек не может, а сервер по нему и сверяет, тому ли
+        адресована кнопка.
+        """
         approve = query.data.startswith("ok:")
-        token = query.data.split(":", 1)[1]
+        approval_id = query.data.split(":", 1)[1]
 
         try:
-            result = await self._api.approve(token, approve)
+            result = await self._api.approve(
+                PLATFORM, query.from_user.id, approval_id, approve
+            )
         except ApiUnavailable:
+            # Сообщение не правим и кнопки не убираем: запрос, возможно, ещё жив,
+            # и человек сможет нажать снова.
             await query.answer(texts.API_UNAVAILABLE, show_alert=True)
             return
 
-        if not approve:
-            text = "❌ Вход отклонён. Если это были не вы — смените пароль."
-        elif result.ok and result.data.get("ok"):
-            text = "✅ Вход подтверждён."
-        else:
-            text = "⌛ Запрос устарел или уже обработан."
+        outcome = str(result.data.get("result") or "")
+        text = self._approval_outcome_text(outcome, approve)
 
-        # Правим исходное сообщение и убираем кнопки: повторно нажимать нечего,
-        # токен уже погашен.
+        if outcome == "FOREIGN":
+            # Кнопка адресована не этому человеку. Исходное сообщение чужое,
+            # править его нельзя — отвечаем всплывающим окном.
+            await query.answer(text, show_alert=True)
+            return
+
+        # Кнопки убираем: решение уже принято, и нажимать больше нечего.
         await self._edit(query, text, None)
         await query.answer()
 
-    async def request_approval(
-        self, chat_id: int, token: str, username: str, ip: str, location: str
-    ) -> None:
+    @staticmethod
+    def _approval_outcome_text(outcome: str, approve: bool) -> str:
+        if outcome == "APPLIED":
+            return (
+                "✅ Вход подтверждён." if approve
+                else "❌ Вход отклонён. Если это были не вы — смените пароль."
+            )
+        if outcome == "ALREADY_DECIDED":
+            return "Этот запрос уже обработан."
+        if outcome == "EXPIRED":
+            return "⌛ Время подтверждения истекло. Зайдите в игру ещё раз."
+        if outcome == "FOREIGN":
+            return "Эта кнопка адресована другому человеку."
+        if outcome == "NOT_FOUND":
+            return "Запрос не найден: возможно, он уже устарел."
+        return "Не получилось обработать нажатие."
+
+    async def request_approval(self, message: BotMessage) -> None:
         """Присылает запрос подтверждения входа с двумя кнопками."""
-        lines = texts.approval_request_lines(username, ip, location)
+        lines = texts.approval_request_lines(
+            message.get("username", "—"),
+            message.get("ip", "—"),
+            texts.format_location(message.get("country"), message.get("city")),
+        )
         await self._safe_send(
-            chat_id,
-            "🔐 <b>" + esc(lines[0]) + "</b>\n\n" + "\n".join(esc(x) for x in lines[1:]),
-            menu.approval_keyboard(token),
+            message.chat_id or message.recipient_id,
+            "🔐 <b>" + esc(lines[0]) + "</b>\n\n"
+            + "\n".join(esc(x) for x in lines[1:]),
+            menu.approval_keyboard(message.get("approvalId")),
         )
 
     async def notify(self, chat_id: int, text: str) -> None:
@@ -418,39 +433,45 @@ class TelegramBot:
             LOGGER.warning("Сообщение в чат %s не доставлено: %s", chat_id, exc)
 
 
-def register_event_handlers(bot: TelegramBot, listener: EventListener) -> None:
-    """Подписывает бота на события KoFAuth.
+def register_message_handlers(bot: TelegramBot, listener: OutboxListener) -> None:
+    """Подписывает бота на очередь сообщений.
 
-    Чат берётся из события: связка «аккаунт → чат» живёт в базе KoFAuth,
-    и дублировать её в памяти бота значило бы терять её при перезапуске.
+    Получатель берётся из сообщения: связка «аккаунт → чат» живёт в базе
+    KoFAuth, и дублировать её в памяти бота значило бы терять её при
+    перезапуске.
+
+    Доставка «не меньше одного раза»: одно и то же сообщение может прийти
+    дважды, если бот упал между обработкой и подтверждением. Для запроса
+    подтверждения это безопасно — повторно показанная кнопка ведёт к тому же
+    самому запросу, а решение по нему всё равно принимается один раз.
     """
 
-    async def on_approval(event: Event) -> None:
-        chat_id = event.get("telegramChatId")
-        token = event.get("approvalToken")
-        if not chat_id.isdigit() or not token:
+    async def on_approval(message: BotMessage) -> None:
+        if not message.get("approvalId"):
             return
-        await bot.request_approval(
-            int(chat_id), token, event.get("username", "—"),
-            event.get("ipMasked", "—"),
-            texts.format_location(event.get("country"), event.get("city")),
-        )
+        await bot.request_approval(message)
 
-    async def on_notice(event: Event) -> None:
-        chat_id = event.get("telegramChatId")
-        if not chat_id.isdigit():
+    async def on_resolved(message: BotMessage) -> None:
+        # Запрос закрыт где-то ещё — например, игрок повторил вход, и прежняя
+        # кнопка обесценилась. Отдельного сообщения не шлём: нажатие такой
+        # кнопки и так ответит «запрос устарел».
+        LOGGER.debug("Запрос %s закрыт со статусом %s",
+                     message.get("approvalId"), message.get("status"))
+
+    async def on_notice(message: BotMessage) -> None:
+        template = NOTICES.get(message.get("event"))
+        if not template:
             return
-        message = NOTICES.get(event.type)
-        if message:
-            await bot.notify(int(chat_id), message.format(
-                username=esc(event.get("username", "")),
-                ip=esc(event.get("ipMasked", "—")),
-                at=esc(texts.format_time(event.get("at"))),
-            ))
+        await bot.notify(message.chat_id or message.recipient_id, template.format(
+            username=esc(message.get("username", "")),
+            ip=esc(message.get("ip", "—")),
+            at=esc(texts.format_time(message.get("at"))),
+        ))
 
-    listener.on("LoginApprovalRequestedEvent", on_approval)
-    for event_type in NOTICES:
-        listener.on(event_type, on_notice)
+    listener.on(event_kinds.LOGIN_APPROVAL, on_approval)
+    listener.on(event_kinds.LOGIN_APPROVAL_RESOLVED, on_resolved)
+    listener.on(event_kinds.LOGIN_NOTICE, on_notice)
+    listener.on(event_kinds.SECURITY_NOTICE, on_notice)
 
 
 NOTICES = {

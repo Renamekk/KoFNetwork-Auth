@@ -54,10 +54,15 @@ public class AuthController {
                     core.tokens().issueTokenPair(result.account().id(),
                             result.session().id(), context.ip()).join()));
 
+            // Отдаётся метка попытки, а не токен. Токен был предъявительским: кто
+            // его прочитал, тот и входил. Метка ничего не открывает — решение
+            // принимает владелец кнопки в мессенджере, и сверяется он по своему
+            // идентификатору, а не по знанию строки.
             case TWO_FACTOR_REQUIRED -> ResponseEntity.ok(new ApiDtos.TwoFactorRequiredResponse(
                     "two_factor_required",
                     String.valueOf(result.requiredTwoFactor()),
-                    result.approvalToken()));
+                    result.attemptId(),
+                    result.approvalProof()));
 
             // Несуществующий аккаунт и неверный пароль отвечают одинаково:
             // различие превратило бы форму входа в проверку существования ников.
@@ -139,6 +144,44 @@ public class AuthController {
                     "Токен обновления недействителен, войдите заново");
         }
         return ResponseEntity.ok(ApiDtos.TokenPairResponse.of(result.value()));
+    }
+
+    /**
+     * Состояние Telegram/Discord-подтверждения для исходной вкладки.
+     *
+     * <p>Идентификатор попытки не находится в URL, а proof не живёт в localStorage:
+     * обновление страницы намеренно требует начать вход заново, чтобы XSS/история
+     * браузера не превращались в способ забрать уже одобренную сессию.
+     */
+    @PostMapping("/approval/status")
+    @Operation(summary = "Проверить ожидание подтверждения входа")
+    public ResponseEntity<?> approvalStatus(@Valid @RequestBody ApiDtos.ApprovalPollBody body) {
+        var status = core.approvals().webStatus(body.attemptId(), body.browserProof()).join();
+        return ResponseEntity.ok(new ApiDtos.ApprovalStatusResponse(
+                status.status().name().toLowerCase(java.util.Locale.ROOT), status.ready()));
+    }
+
+    /**
+     * Единственный путь, на котором браузер получает токены после кнопки в Telegram.
+     * Сам Telegram видит лишь ID задачи, а это POST-тело содержит tab-local proof;
+     * атомарное погашение в Core не даёт повтору или второй вкладке получить пару ещё раз.
+     */
+    @PostMapping("/approval/exchange")
+    @Operation(summary = "Одноразово обменять одобренную WEB-попытку на сессию")
+    public ResponseEntity<?> approvalExchange(@Valid @RequestBody ApiDtos.ApprovalPollBody body,
+                                              HttpServletRequest request) {
+        var exchange = core.approvals().exchangeWeb(body.attemptId(), body.browserProof()).join();
+        if (!exchange.consumed() || exchange.accountId() == null || exchange.sessionId() == null) {
+            return status(HttpStatus.CONFLICT, "APPROVAL_NOT_EXCHANGEABLE",
+                    switch (exchange.status()) {
+                        case DENIED -> "Вход отклонён в мессенджере";
+                        case EXPIRED -> "Подтверждение истекло или открыто в другой вкладке";
+                        default -> "Подтверждение ещё не завершено";
+                    });
+        }
+        return ResponseEntity.ok(ApiDtos.TokenPairResponse.of(core.tokens().issueTokenPair(
+                exchange.accountId(), exchange.sessionId(),
+                RequestContext.clientIp(request, core.config())).join()));
     }
 
     @PostMapping("/logout")

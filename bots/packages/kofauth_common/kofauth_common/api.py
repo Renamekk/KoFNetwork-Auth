@@ -6,9 +6,13 @@
 Второй её экземпляр на Python неизбежно разошёлся бы с первым.
 
 Ошибки транспорта и ошибки предметной области здесь разделены. Отказ сети —
-исключение: продолжать нечем. Отказ по существу («код истёк», «уже привязано»)
-— обычный результат, который бот показывает человеку, поэтому он возвращается
-значением, а не исключением.
+исключение: продолжать нечем. Отказ по существу («запрос устарел», «уже
+привязано») — обычный результат, который бот показывает человеку, поэтому он
+возвращается значением, а не исключением.
+
+Через этот же клиент приходят сообщения из очереди: подписки на Redis у ботов
+больше нет. Она требовала мастер-пароля хранилища и при этом теряла сообщения
+при любом перезапуске бота.
 """
 
 from __future__ import annotations
@@ -64,7 +68,7 @@ class KoFAuthApi:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def __aenter__(self) -> "KoFAuthApi":
+    async def __aenter__(self) -> KoFAuthApi:
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
@@ -130,22 +134,46 @@ class KoFAuthApi:
 
     # ------------------------------------------------------------------ действия
 
-    async def approve(self, token: str, approved: bool) -> ApiResult:
-        """Подтверждает или отклоняет вход.
+    async def approve(
+        self, platform: str, external_id: int, approval_id: str, approved: bool
+    ) -> ApiResult:
+        """Передаёт нажатие кнопки на сервер.
 
-        Токен одноразовый: повторное нажатие кнопки вернёт неуспех, а не создаст
-        вторую сессию.
+        Идентификатор запроса сам по себе ничего не открывает: сервер сверяет,
+        что нажал тот, кому кнопка адресована, и применяет решение атомарно.
+        Поэтому вместе с идентификатором обязательно едет ``external_id``
+        нажавшего — его подставляет бот из данных мессенджера, а не человек.
+
+        Повторное нажатие вернёт уже записанный исход, а не создаст вторую
+        сессию: ``result`` расскажет, что именно произошло.
         """
         return await self._request(
-            "POST", "/api/bot/approval", json={"token": token, "approved": approved}
+            "POST",
+            "/api/bot/approval",
+            json={
+                "platform": platform,
+                "externalId": external_id,
+                "approvalId": approval_id,
+                "approved": approved,
+            },
         )
 
-    async def send_code(self, platform: str, external_id: int) -> ApiResult:
-        """Выдаёт код подтверждения входа для ручного ввода в игре."""
+    # ------------------------------------------------------------------ очередь
+
+    async def events(self, platform: str, limit: int = 100) -> ApiResult:
+        """Читает очередь сообщений, адресованных этой платформе."""
+        return await self._request(
+            "GET",
+            "/api/bot/events",
+            params={"platform": platform, "limit": limit},
+        )
+
+    async def ack(self, platform: str, cursor: int) -> ApiResult:
+        """Подтверждает обработку сообщений до указанного номера."""
         return await self._request(
             "POST",
-            "/api/bot/sendcode",
-            json={"platform": platform, "externalId": external_id},
+            "/api/bot/events/ack",
+            json={"platform": platform, "cursor": cursor},
         )
 
     async def set_login_approval(

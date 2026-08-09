@@ -29,8 +29,11 @@ import java.util.Objects;
  *   <li>{@link LoginResultType#BAD_PASSWORD} — {@link #remainingAttempts()}.</li>
  * </ul>
  *
- * @param approvalToken токен подтверждения входа для Telegram и Discord: по нему бот
- *                      находит ожидающий запрос, когда игрок нажимает кнопку
+ * @param attemptId идентификатор попытки входа, ожидающей подтверждения в мессенджере.
+ *                  Раньше здесь ехал предъявительский токен, по которому мог войти
+ *                  любой, кто его прочитал. Теперь это лишь метка, по которой прокси
+ *                  узнаёт «решение относится к тому входу, что я веду»; ничего открыть
+ *                  ею нельзя — решение принимает владелец кнопки на стороне сервера
  */
 public record AuthResult(
         @NotNull LoginResultType type,
@@ -40,7 +43,8 @@ public record AuthResult(
         @Nullable CaptchaChallenge captcha,
         @Nullable Duration retryAfter,
         int remainingAttempts,
-        @Nullable String approvalToken,
+        @Nullable String attemptId,
+        @Nullable String approvalProof,
         @Nullable String detail
 ) {
 
@@ -51,27 +55,28 @@ public record AuthResult(
     /** Успешный вход. */
     public static @NotNull AuthResult success(@NotNull Account account, @NotNull Session session) {
         return new AuthResult(LoginResultType.SUCCESS, account, session,
-                null, null, null, 0, null, null);
+                null, null, null, 0, null, null, null);
     }
 
     /**
      * Пароль верен, но нужен второй фактор.
      *
-     * @param approvalToken для {@link TwoFactorMethod#TELEGRAM} и
-     *                      {@link TwoFactorMethod#DISCORD}; для TOTP — {@code null}
+     * @param attemptId для {@link TwoFactorMethod#TELEGRAM} и {@link TwoFactorMethod#DISCORD} —
+     *                  метка попытки, которую подтверждают кнопкой; для TOTP — {@code null}
      */
     public static @NotNull AuthResult twoFactorRequired(@NotNull Account account,
                                                         @NotNull TwoFactorMethod method,
-                                                        @Nullable String approvalToken) {
+                                                        @Nullable String attemptId,
+                                                        @Nullable String approvalProof) {
         return new AuthResult(LoginResultType.TWO_FACTOR_REQUIRED, account, null,
-                method, null, null, 0, approvalToken, null);
+                method, null, null, 0, attemptId, approvalProof, null);
     }
 
     /** Требуется пройти CAPTCHA. */
     public static @NotNull AuthResult captchaRequired(@Nullable Account account,
                                                       @NotNull CaptchaChallenge challenge) {
         return new AuthResult(LoginResultType.CAPTCHA_REQUIRED, account, null,
-                null, challenge, null, 0, null, null);
+                null, challenge, null, 0, null, null, null);
     }
 
     /**
@@ -81,7 +86,7 @@ public record AuthResult(
      */
     public static @NotNull AuthResult badPassword(int remainingAttempts) {
         return new AuthResult(LoginResultType.BAD_PASSWORD, null, null,
-                null, null, null, remainingAttempts, null, null);
+                null, null, null, remainingAttempts, null, null, null);
     }
 
     /**
@@ -92,29 +97,29 @@ public record AuthResult(
      */
     public static @NotNull AuthResult unknownAccount() {
         return new AuthResult(LoginResultType.UNKNOWN_ACCOUNT, null, null,
-                null, null, null, 0, null, null);
+                null, null, null, 0, null, null, null);
     }
 
     /** Превышен лимит попыток. */
     public static @NotNull AuthResult rateLimited(@NotNull Duration retryAfter) {
         return new AuthResult(LoginResultType.RATE_LIMITED, null, null,
-                null, null, retryAfter, 0, null, null);
+                null, null, retryAfter, 0, null, null, null);
     }
 
     /** Временная блокировка после серии неудач. */
     public static @NotNull AuthResult temporarilyLocked(@NotNull Duration retryAfter) {
         return new AuthResult(LoginResultType.TEMPORARILY_LOCKED, null, null,
-                null, null, retryAfter, 0, null, null);
+                null, null, retryAfter, 0, null, null, null);
     }
 
     /** Отказ без дополнительного контекста: бан, блокировка администратором, AntiBot. */
     public static @NotNull AuthResult rejected(@NotNull LoginResultType type, @Nullable String detail) {
-        return new AuthResult(type, null, null, null, null, null, 0, null, detail);
+        return new AuthResult(type, null, null, null, null, null, 0, null, null, detail);
     }
 
     /** Внутренняя ошибка. Игроку показывается нейтральное сообщение, подробность — в лог. */
     public static @NotNull AuthResult error(@Nullable String detail) {
-        return new AuthResult(LoginResultType.ERROR, null, null, null, null, null, 0, null, detail);
+        return new AuthResult(LoginResultType.ERROR, null, null, null, null, null, 0, null, null, detail);
     }
 
     public boolean isSuccess() {
@@ -124,5 +129,15 @@ public record AuthResult(
     /** Ждёт ли система следующего шага от игрока (код, капча, кнопка в мессенджере). */
     public boolean isPending() {
         return type == LoginResultType.TWO_FACTOR_REQUIRED || type == LoginResultType.CAPTCHA_REQUIRED;
+    }
+
+    /** Не даёт временно вернуть browser proof в логи через стандартный record toString. */
+    @Override
+    public String toString() {
+        return "AuthResult{type=" + type + ", account="
+                + (account == null ? "null" : account.username()) + ", session="
+                + (session == null ? "null" : session.publicId()) + ", requiredTwoFactor="
+                + requiredTwoFactor + ", attemptId=" + attemptId + ", approvalProof="
+                + (approvalProof == null ? "null" : "<redacted>") + ", detail=" + detail + '}';
     }
 }

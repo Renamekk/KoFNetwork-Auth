@@ -1,23 +1,21 @@
 package net.kofnetwork.auth.velocity.listener;
 
 import com.velocitypowered.api.event.PostOrder;
-import com.velocitypowered.api.event.ResultedEvent;
 import com.velocitypowered.api.event.Subscribe;
+import com.velocitypowered.api.event.command.CommandExecuteEvent;
 import com.velocitypowered.api.event.connection.DisconnectEvent;
 import com.velocitypowered.api.event.connection.PostLoginEvent;
 import com.velocitypowered.api.event.connection.PreLoginEvent;
 import com.velocitypowered.api.event.player.PlayerChatEvent;
 import com.velocitypowered.api.event.player.ServerConnectedEvent;
 import com.velocitypowered.api.event.player.ServerPreConnectEvent;
-import com.velocitypowered.api.event.command.CommandExecuteEvent;
 import com.velocitypowered.api.proxy.Player;
-import com.velocitypowered.api.proxy.server.RegisteredServer;
-import net.kofnetwork.auth.api.KoFAuth;
 import net.kofnetwork.auth.api.config.ConfigFile;
 import net.kofnetwork.auth.api.model.AuthState;
 import net.kofnetwork.auth.api.model.IpAddress;
 import net.kofnetwork.auth.core.KoFAuthCore;
-import net.kofnetwork.auth.velocity.limbo.LimboRouter;
+import net.kofnetwork.auth.velocity.limbo.PlayerTransfer;
+import net.kofnetwork.auth.velocity.limbo.ServerPool;
 import net.kofnetwork.auth.velocity.message.MessageService;
 import org.slf4j.Logger;
 
@@ -32,21 +30,33 @@ import java.util.UUID;
  * ограничения продублированы на Paper (см. {@code KoFAuth-Paper}), но именно
  * прокси — единственная точка, которую нельзя обойти прямым подключением к
  * бэкенду при правильно настроенном {@code player-info-forwarding}.
+ *
+ * <p><b>Отказ хранилища состояния не открывает проход.</b> Состояние машины входа
+ * живёт в общем хранилище, и раньше его недоступность возвращала значение по
+ * умолчанию — {@code CONNECTING}, — а дальше ветвление шло так, будто это обычное
+ * начало сессии. Теперь отказ отличим от «записи нет», и игрок при отказе
+ * отключается с понятным сообщением, а не проходит на угад.
  */
 public final class AuthenticationListener {
 
     private final KoFAuthCore core;
-    private final LimboRouter router;
+    private final ServerPool pool;
+    private final PlayerTransfer transfer;
     private final MessageService messages;
+    private final PendingLogins pendingLogins;
     private final Logger logger;
 
     public AuthenticationListener(KoFAuthCore core,
-                                  LimboRouter router,
+                                  ServerPool pool,
+                                  PlayerTransfer transfer,
                                   MessageService messages,
+                                  PendingLogins pendingLogins,
                                   Logger logger) {
         this.core = core;
-        this.router = router;
+        this.pool = pool;
+        this.transfer = transfer;
         this.messages = messages;
+        this.pendingLogins = pendingLogins;
         this.logger = logger;
     }
 
@@ -56,6 +66,11 @@ public final class AuthenticationListener {
      * <p>Самая дешёвая точка отказа: соединение ещё не стало игроком, ресурсы
      * на него не потрачены. Именно здесь отрабатывает AntiBot — пропустить
      * ботнет дальше означает создать тысячи объектов Player.
+     *
+     * <p><b>Отказ проверки закрывает вход, а не открывает.</b> Прежняя версия ловила
+     * исключение, писала его в лог и пропускала соединение: при недоступном хранилище
+     * AntiBot и ограничение скорости выключались целиком — ровно в тот момент, когда
+     * они нужнее всего.
      */
     @Subscribe(order = PostOrder.EARLY)
     public void onPreLogin(PreLoginEvent event) {
@@ -78,8 +93,11 @@ public final class AuthenticationListener {
                                 "<red>Вход через VPN или прокси запрещён.")));
             }
         } catch (RuntimeException e) {
-            // Отказ проверки не должен закрывать вход всей сети.
-            logger.error("Ошибка проверки подключения с {}", ip.asMasked(), e);
+            logger.error("Проверка подключения с {} не выполнена: соединение отклонено",
+                    ip.asMasked(), e);
+            event.setResult(PreLoginEvent.PreLoginComponentResult.denied(
+                    messages.kick("unavailable",
+                            "<red>Сервер авторизации недоступен. Попробуйте позже.")));
         }
     }
 
@@ -92,23 +110,17 @@ public final class AuthenticationListener {
      * «дописал состояние». Раньше метод отдавал управление сразу, и следующий
      * за ним {@link ServerPreConnectEvent} успевал прочитать состояние по
      * умолчанию — {@code CONNECTING}. Для игрока с действующей сессией это
-     * означало отправку в Limbo вместо игрового сервера при каждом
-     * переподключении.
-     *
-     * <p>Событие выполняется вне сетевого потока, поэтому блокировка допустима:
-     * тормозится вход одного игрока, а не работа прокси. Так же поступает
-     * {@link #onPreLogin(PreLoginEvent)}.
+     * означало отправку в Limbo вместо игрового сервера при каждом переподключении.
      *
      * <p><b>Состояние задаётся, а не меняется.</b> Используется
      * {@link net.kofnetwork.auth.api.service.SessionService#resetState} — новое
      * соединение начинает машину входа с нуля. Прежний вариант вызывал
      * {@code setState}, который отвергает переход из терминальных состояний
      * {@code AUTHENTICATED} и {@code BLOCKED}. Запись о прошлом входе переживает
-     * соединение (разрыв связи доходит до прокси не всегда, а сам прокси может
-     * быть перезапущен), поэтому у вернувшегося игрока с истёкшей сессией переход
+     * соединение, поэтому у вернувшегося игрока с истёкшей сессией переход
      * «нужен пароль» отвергался, состояние оставалось {@code AUTHENTICATED} —
-     * и {@link #onServerPreConnect} отправлял его мимо Limbo прямо на игровой
-     * сервер, где бэкенд, не найдя сессии, отключал его с ошибкой.
+     * и маршрутизация отправляла его мимо Limbo прямо на игровой сервер, где
+     * бэкенд, не найдя сессии, отключал его с ошибкой.
      */
     @Subscribe(order = PostOrder.EARLY)
     public void onPostLogin(PostLoginEvent event) {
@@ -123,6 +135,7 @@ public final class AuthenticationListener {
                             // Действующая сессия: игрок продолжает с того же места,
                             // повторный ввод пароля после разрыва соединения раздражает
                             // и ничего не добавляет к безопасности.
+                            pendingLogins.completed(uuid);
                             return core.sessions().resetState(uuid, AuthState.AUTHENTICATED);
                         }
                         return core.authentication().findAccount(player.getUsername())
@@ -133,11 +146,12 @@ public final class AuthenticationListener {
                     })
                     .join();
         } catch (RuntimeException e) {
-            // Состояние не определилось. Явно ставим CONNECTING: остаток прошлого
-            // входа мог бы оказаться AUTHENTICATED и пропустить игрока дальше.
-            logger.error("Не удалось определить состояние игрока {}",
+            // Состояние не определилось — хранилище недоступно. Пропускать игрока
+            // дальше нельзя: без состояния его не отличить от вошедшего.
+            logger.error("Не удалось определить состояние игрока {}: отключаю",
                     player.getUsername(), e);
-            core.sessions().resetState(uuid, AuthState.CONNECTING);
+            player.disconnect(messages.kick("unavailable",
+                    "<red>Сервер авторизации недоступен. Попробуйте позже."));
         }
     }
 
@@ -145,49 +159,79 @@ public final class AuthenticationListener {
      * Маршрутизация: неаутентифицированный игрок попадает только в Limbo.
      *
      * <p>Событие синхронное по контракту Velocity, поэтому состояние читается
-     * блокирующе. Оно берётся из Redis — операция на доли миллисекунды.
+     * блокирующе. Оно берётся из общего хранилища — операция на доли миллисекунды.
+     *
+     * <p><b>Первичное подключение тоже проходит через выбор.</b> Раньше игрок,
+     * которого {@code velocity.toml} отправлял на {@code limbo-1}, попадал туда без
+     * всякой проверки: ветка «цель уже Limbo» возвращала управление, ничего не решив.
+     * Из-за этого весь заход приходился на первый инстанс независимо от его состояния
+     * и загрузки — а если он был выключен, игрок отправлялся на выключенный сервер.
      */
     @Subscribe(order = PostOrder.FIRST)
     public void onServerPreConnect(ServerPreConnectEvent event) {
         Player player = event.getPlayer();
-        AuthState state = core.sessions().getState(player.getUniqueId()).join();
-
         String target = event.getOriginalServer().getServerInfo().getName();
 
-        if (!state.requiresLimbo()) {
-            // Игрок с действующей сессией не должен попадать в Limbo. Сам он туда
-            // и не просится: в velocity.toml `try` обязан указывать на Limbo,
-            // поэтому первое подключение любого игрока идёт именно туда. Без этой
-            // ветки вернувшийся игрок оставался в Limbo навсегда — перевести его
-            // дальше было некому, потому что /login он не выполнял.
-            if (router.isLimbo(target)) {
-                Optional<RegisteredServer> lobby = router.selectLobby();
-                if (lobby.isPresent()) {
-                    event.setResult(ServerPreConnectEvent.ServerResult.allowed(lobby.get()));
-                    return;
-                }
-                // Лобби недоступно — пусть подождёт в Limbo. Он аутентифицирован,
-                // и оставить его там безопаснее, чем отключить.
-                logger.warn("Лобби недоступно, вошедший игрок {} остаётся в Limbo",
-                        player.getUsername());
-            }
-            return;
-        }
-
-        if (router.isLimbo(target)) {
-            return;
-        }
-
-        Optional<RegisteredServer> limbo = router.selectLimbo();
-        if (limbo.isEmpty()) {
-            if (router.kickWhenLimboUnavailable()) {
-                player.disconnect(messages.kick("limbo-unavailable",
-                        "<red>Сервер авторизации недоступен. Попробуйте позже."));
-            }
+        AuthState state;
+        try {
+            state = core.sessions().getState(player.getUniqueId()).join();
+        } catch (RuntimeException e) {
+            logger.error("Состояние игрока {} недоступно: подключение отклонено",
+                    player.getUsername(), e);
             event.setResult(ServerPreConnectEvent.ServerResult.denied());
+            player.disconnect(messages.kick("unavailable",
+                    "<red>Сервер авторизации недоступен. Попробуйте позже."));
             return;
         }
-        event.setResult(ServerPreConnectEvent.ServerResult.allowed(limbo.get()));
+
+        if (!state.requiresLimbo()) {
+            routeAuthenticated(event, player, target);
+            return;
+        }
+        routeToLimbo(event, player, target);
+    }
+
+    /** Вошедшего игрока не держим в Limbo: переводим на хаб. */
+    private void routeAuthenticated(ServerPreConnectEvent event, Player player, String target) {
+        if (!pool.isLimbo(target)) {
+            return;
+        }
+        // Сам он в Limbo и не просится: в velocity.toml `try` обязан указывать на
+        // Limbo, поэтому первое подключение любого игрока идёт именно туда. Без
+        // этой ветки вернувшийся игрок оставался в Limbo навсегда — перевести его
+        // дальше было некому, потому что /login он не выполнял.
+        Optional<ServerPool.Reservation> hub = pool.reserveHub();
+        if (hub.isPresent()) {
+            // Бронь держится до подключения: отпустить её здесь значило бы снова
+            // показать следующему игроку место свободным, пока этот ещё в пути.
+            pool.trackRouting(player.getUniqueId(), hub.get());
+            event.setResult(ServerPreConnectEvent.ServerResult.allowed(hub.get().server()));
+            return;
+        }
+        // Хаб недоступен — пусть подождёт в Limbo. Он аутентифицирован,
+        // и оставить его там безопаснее, чем отключить.
+        logger.warn("Хаб недоступен, вошедший игрок {} остаётся в Limbo", player.getUsername());
+    }
+
+    /** Неаутентифицированный игрок допускается только в Limbo, выбранный по здоровью и ёмкости. */
+    private void routeToLimbo(ServerPreConnectEvent event, Player player, String target) {
+        Optional<ServerPool.Reservation> limbo = pool.reserveLimbo();
+        if (limbo.isEmpty()) {
+            // Все Limbo недоступны или заполнены. Пропускать неаутентифицированного
+            // игрока куда-либо ещё нельзя ни при каких настройках.
+            event.setResult(ServerPreConnectEvent.ServerResult.denied());
+            player.disconnect(messages.kick("limbo-unavailable",
+                    "<red>Сервер авторизации недоступен. Попробуйте позже."));
+            return;
+        }
+        ServerPool.Reservation reservation = limbo.get();
+        pool.trackRouting(player.getUniqueId(), reservation);
+        if (reservation.name().equals(target)) {
+            // Выбор совпал с исходной целью — подменять результат не нужно,
+            // но место всё равно занято до конца подключения.
+            return;
+        }
+        event.setResult(ServerPreConnectEvent.ServerResult.allowed(reservation.server()));
     }
 
     /**
@@ -201,7 +245,7 @@ public final class AuthenticationListener {
         if (!(event.getCommandSource() instanceof Player player)) {
             return;
         }
-        AuthState state = core.sessions().getState(player.getUniqueId()).join();
+        AuthState state = stateOrBlocked(player);
         if (state.isAuthenticated()) {
             return;
         }
@@ -237,12 +281,28 @@ public final class AuthenticationListener {
         if (!core.config().getBoolean(ConfigFile.VELOCITY, "restrictions.block-chat", true)) {
             return;
         }
-        AuthState state = core.sessions().getState(player.getUniqueId()).join();
-        if (state.isAuthenticated()) {
+        if (stateOrBlocked(player).isAuthenticated()) {
             return;
         }
         event.setResult(PlayerChatEvent.ChatResult.denied());
-        player.sendMessage(promptFor(state));
+        player.sendMessage(promptFor(stateOrBlocked(player)));
+    }
+
+    /**
+     * Состояние игрока; при отказе хранилища — {@link AuthState#BLOCKED}.
+     *
+     * <p>Значение по умолчанию выбрано так, чтобы отказ закрывал, а не открывал:
+     * недоступное хранилище не должно превращать неаутентифицированного игрока
+     * в аутентифицированного.
+     */
+    private AuthState stateOrBlocked(Player player) {
+        try {
+            return core.sessions().getState(player.getUniqueId()).join();
+        } catch (RuntimeException e) {
+            logger.warn("Состояние игрока {} недоступно, считаю его невошедшим",
+                    player.getUsername(), e);
+            return AuthState.BLOCKED;
+        }
     }
 
     /**
@@ -256,6 +316,9 @@ public final class AuthenticationListener {
     public void onServerConnected(ServerConnectedEvent event) {
         Player player = event.getPlayer();
         String server = event.getServer().getServerInfo().getName();
+
+        // Игрок доехал — бронь больше не нужна: теперь он считается подключённым.
+        pool.routingCompleted(player.getUniqueId());
 
         core.sessions().currentPublicId(player.getUniqueId())
                 .thenCompose(publicId -> publicId
@@ -273,20 +336,22 @@ public final class AuthenticationListener {
      * <p><b>Состояние машины входа намеренно не удаляется.</b> Раньше здесь
      * вызывался {@code clearState}, и это была гонка: обработчик отключения
      * асинхронный, а игрок может переподключиться раньше, чем цепочка дойдёт до
-     * Redis. Тогда удаление приходило уже после того, как {@link #onPostLogin}
+     * хранилища. Тогда удаление приходило уже после того, как {@link #onPostLogin}
      * записал состояние нового соединения, и стирало именно его — вернувшийся
      * игрок с действующей сессией оказывался в Limbo и был вынужден вводить
      * пароль заново.
      *
      * <p>Удалять и незачем: у записи есть срок жизни, а каждое новое подключение
-     * всё равно перезаписывает её через
-     * {@link net.kofnetwork.auth.api.service.SessionService#resetState}.
-     * Капча — другое дело: незакрытая задача переживает соединение, и ответ на
-     * неё игрок уже не увидит, поэтому её гасим.
+     * всё равно перезаписывает её через {@code resetState}. Капча — другое дело:
+     * незакрытая задача переживает соединение, и ответ на неё игрок уже не увидит.
      */
     @Subscribe
     public void onDisconnect(DisconnectEvent event) {
         UUID uuid = event.getPlayer().getUniqueId();
+
+        // Игрок не доехал — место освобождается, иначе бронь осталась бы навсегда
+        // и постепенно вывела бы сервер из выбора.
+        pool.routingCompleted(uuid);
 
         core.sessions().getState(uuid)
                 .thenCompose(state -> state.isAuthenticated()

@@ -120,12 +120,67 @@ public interface CacheProvider extends AutoCloseable {
     // ------------------------------------------------------------------ состояние
 
     /**
-     * Работает ли кэш прямо сейчас.
+     * Работает ли хранилище прямо сейчас.
      *
-     * <p>{@code false} — не ошибка: это либо отключённый в конфигурации Redis,
-     * либо временно недоступный. Вызывающий в обоих случаях идёт в MySQL.
+     * <p>{@code false} означает отказ, а не «данных нет». Отличать это обязательно:
+     * в Redis лежит не только кэш, но и состояние машины входа, привязка UUID к сессии
+     * и счётчики ограничения скорости — того, чего в MySQL нет и восстановить неоткуда.
      */
     boolean isAvailable();
+
+    /**
+     * Общая ли это память для всех процессов сети.
+     *
+     * <p>{@code false} у локальной реализации: она честно хранит состояние, но только
+     * своё. На сети из одного прокси этого достаточно; на нескольких — нет, и подписчик
+     * межпроцессной шины по этому признаку понимает, что соседей он не услышит.
+     */
+    default boolean isDistributed() {
+        return true;
+    }
+
+    /**
+     * Операции, для которых промах и отказ — разные события.
+     *
+     * <p>Обычные методы этого интерфейса по-прежнему прощают отказ: промах кэша
+     * вызывающий и так обязан обрабатывать походом в MySQL, и заставлять его ловить
+     * исключение ради того же самого действия незачем.
+     *
+     * <p>Но для состояния входа, привязки сессии и счётчиков лимитов запасного пути нет.
+     * Прежняя реализация отвечала на отказ Redis тем же «нет данных», и система
+     * продолжала работать так, будто ничего не случилось: игрок оказывался
+     * неаутентифицированным, ограничения скорости переставали накапливаться, а события
+     * не доходили до соседних узлов. Здесь такой вызов завершается
+     * {@link net.kofnetwork.auth.api.exception.CacheUnavailableException}, и вызывающий
+     * обязан отказать в действии.
+     */
+    @NotNull Critical critical();
+
+    /**
+     * Строгие операции: отказ хранилища виден вызывающему.
+     *
+     * <p>Пустой {@link Optional} здесь означает ровно «ключа нет» и ничего больше.
+     */
+    interface Critical {
+
+        @NotNull CompletableFuture<Optional<String>> get(@NotNull String key);
+
+        @NotNull CompletableFuture<Void> set(@NotNull String key,
+                                             @NotNull String value,
+                                             @NotNull Duration ttl);
+
+        @NotNull CompletableFuture<Boolean> delete(@NotNull String key);
+
+        @NotNull CompletableFuture<Map<String, String>> getHash(@NotNull String key);
+
+        @NotNull CompletableFuture<Void> setHash(@NotNull String key,
+                                                 @NotNull Map<String, String> values,
+                                                 @NotNull Duration ttl);
+
+        /** @return число событий в окне с учётом текущего */
+        @NotNull CompletableFuture<Long> incrementSlidingWindow(@NotNull String key,
+                                                                 @NotNull Duration window);
+    }
 
     /** Имя реализации для {@code /auth info}. */
     @NotNull String providerName();

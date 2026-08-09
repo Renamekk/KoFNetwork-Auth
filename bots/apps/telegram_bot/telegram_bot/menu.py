@@ -50,7 +50,6 @@ def main_menu(linked: bool) -> InlineKeyboardMarkup:
     builder.row(_button("👤 Профиль", PROFILE), _button("🛡 Защита", SECURITY))
     builder.row(_button("💻 Устройства", DEVICES), _button("🕘 История", HISTORY))
     builder.row(_button("🔑 Сессии", SESSIONS))
-    builder.row(_action("🔢 Код для входа", "sendcode"))
     builder.row(_button("❓ Справка", HELP))
     return builder.as_markup()
 
@@ -96,16 +95,20 @@ def confirm_unlink() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def approval_keyboard(token: str) -> InlineKeyboardMarkup:
+def approval_keyboard(approval_id: str) -> InlineKeyboardMarkup:
     """Кнопки подтверждения входа.
 
-    Токен едет прямо в ``callback_data``: он одноразовый, живёт две минуты и
-    гасится сервером при первом нажатии. Хранить его в памяти бота значило бы
-    терять запросы при перезапуске контейнера.
+    Ровно две и никаких кодов. В ``callback_data`` едет идентификатор запроса —
+    не секрет: сам по себе он ничего не открывает, потому что сервер сверяет
+    ещё и того, кто нажал. Прежде здесь был предъявительский токен, и его
+    достаточно было прочитать, чтобы войти.
+
+    Идентификатор хранится в кнопке, а не в памяти бота: перезапуск контейнера
+    не должен превращать уже показанные кнопки в неработающие.
     """
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="✅ Это я", callback_data=f"ok:{token}"),
-        InlineKeyboardButton(text="❌ Это не я", callback_data=f"no:{token}"),
+        InlineKeyboardButton(text="✅ Войти", callback_data=f"ok:{approval_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"no:{approval_id}"),
     )
     return builder.as_markup()

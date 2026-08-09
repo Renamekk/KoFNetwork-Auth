@@ -51,15 +51,19 @@ public interface AuthenticationService {
                                                              @NotNull AuthContext context);
 
     /**
-     * Завершает вход подтверждением из Telegram или Discord.
+     * Завершает вход, подтверждённый кнопкой в мессенджере.
      *
-     * @param approvalToken значение из {@link AuthResult#approvalToken()}
-     * @param approved      {@code false}, если владелец нажал «Это не я» — тогда вход
-     *                      отклоняется, а аккаунт получает событие подозрительной активности
+     * <p>Вызывается не ботом и не контроллером, а
+     * {@link LoginApprovalService}, когда решение владельца уже записано атомарно.
+     * Прежний метод принимал предъявительский токен и потому мог быть вызван кем
+     * угодно и когда угодно — в том числе без живой попытки входа; здесь на входе
+     * запись подтверждения, которая существует только как продолжение проверки пароля.
+     *
+     * @return сессия исходной попытки (GAME либо WEB, согласно сохранённому контексту)
+     *         либо пустое значение, если завершить вход не удалось
      */
-    @NotNull CompletableFuture<AuthResult> completeApproval(@NotNull String approvalToken,
-                                                            boolean approved,
-                                                            @NotNull AuthContext context);
+    @NotNull CompletableFuture<java.util.Optional<net.kofnetwork.auth.api.model.Session>>
+            completeApprovedLogin(@NotNull net.kofnetwork.auth.api.model.LoginApproval approval);
 
     /**
      * Проверяет пароль без создания сессии.

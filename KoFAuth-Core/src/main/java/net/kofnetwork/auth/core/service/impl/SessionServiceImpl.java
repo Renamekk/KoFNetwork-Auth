@@ -109,12 +109,18 @@ public final class SessionServiceImpl implements SessionService {
         return sessions.insert(session).thenCompose(saved -> cacheSession(saved).thenApply(ignored -> saved));
     }
 
-    /** Кладёт горячую копию сессии в Redis. */
+    /**
+     * Кладёт горячую копию сессии в общее хранилище.
+     *
+     * <p>Операция строгая: без этой записи сессия не видна другим процессам, и молча
+     * продолжать значило бы выдать игроку сессию, которой для остальной сети не
+     * существует.
+     */
     private CompletableFuture<Void> cacheSession(Session session) {
         // Ключ по UUID игрока недоступен: сессия знает только accountId. Для игры
         // ключом служит публичный идентификатор, а связка uuid → сессия
         // устанавливается платформенным модулем через cacheForPlayer.
-        return cache.setHash(CacheProvider.Keys.SESSION + session.publicId(),
+        return cache.critical().setHash(CacheProvider.Keys.SESSION + session.publicId(),
                 Map.of(FIELD_ACCOUNT_ID, String.valueOf(session.accountId()),
                         FIELD_PUBLIC_ID, session.publicId(),
                         FIELD_IP, session.ip().asString(),
@@ -122,16 +128,24 @@ public final class SessionServiceImpl implements SessionService {
                 slidingTtl());
     }
 
+    /**
+     * Привязывает UUID игрока к сессии.
+     *
+     * <p>Строгая операция. Молчаливый отказ здесь означал бы сессию в MySQL, которую
+     * никто не может найти по игроку: {@code validate} промахивается, игрок вводит
+     * пароль заново — и так на каждом подключении, пока запись не истечёт.
+     */
     @Override
     public @NotNull CompletableFuture<Void> cacheForPlayer(@NotNull UUID playerUuid,
                                                            @NotNull Session session) {
-        return cache.set(CacheProvider.Keys.SESSION + playerUuid, session.publicId(), slidingTtl());
+        return cache.critical().set(CacheProvider.Keys.SESSION + playerUuid,
+                session.publicId(), slidingTtl());
     }
 
     @Override
     public @NotNull CompletableFuture<Optional<Session>> validate(@NotNull UUID playerUuid,
                                                                   @NotNull IpAddress currentIp) {
-        return cache.get(CacheProvider.Keys.SESSION + playerUuid)
+        return cache.critical().get(CacheProvider.Keys.SESSION + playerUuid)
                 .thenCompose(publicId -> publicId
                         .map(id -> validateByPublicId(id, currentIp))
                         .orElseGet(() -> CompletableFuture.completedFuture(Optional.empty())));
@@ -139,7 +153,7 @@ public final class SessionServiceImpl implements SessionService {
 
     @Override
     public @NotNull CompletableFuture<Optional<String>> currentPublicId(@NotNull UUID playerUuid) {
-        return cache.get(CacheProvider.Keys.SESSION + playerUuid);
+        return cache.critical().get(CacheProvider.Keys.SESSION + playerUuid);
     }
 
     @Override
@@ -247,7 +261,8 @@ public final class SessionServiceImpl implements SessionService {
             // Привязка перезаписывается тем же значением ради нового срока жизни:
             // без этого она истекает раньше продлённой сессии, и сессию перестаёт
             // быть видно по UUID.
-            return cache.set(CacheProvider.Keys.SESSION + playerUuid, publicId.get(), slidingTtl())
+            return cache.critical().set(CacheProvider.Keys.SESSION + playerUuid,
+                            publicId.get(), slidingTtl())
                     .thenCompose(ignored -> touch(publicId.get(), context));
         });
     }
@@ -276,10 +291,33 @@ public final class SessionServiceImpl implements SessionService {
                         return events.publish(AccountLogoutEvent.of(
                                 session.accountId(), publicId, reason));
                     })
+                    // Точечный отзыв обязан дойти до остальных процессов.
+                    // AccountLogoutEvent для этого не годится: у межпроцессной шины
+                    // нет его описания, поэтому он остаётся локальным, и игрок,
+                    // чью сессию завершили из личного кабинета, продолжал играть
+                    // на прокси до истечения срока. SessionInvalidatedEvent несёт
+                    // ровно один идентификатор — охват SOME, без двусмысленности.
+                    .thenCompose(ignored -> events.publish(
+                            SessionInvalidatedEvent.single(session.accountId(), publicId, reason)))
                     .thenApply(ignored -> OperationResult.<Void>ok());
         });
     }
 
+    /**
+     * Отзывает сессии аккаунта и сообщает об этом сети.
+     *
+     * <p><b>Охват события задаётся явно.</b> Раньше он выводился из перечня: пустой
+     * означал «все». Из-за этого вызов с {@code exceptPublicId} для аккаунта без
+     * прежних сессий — обычный случай первого входа — публиковал «отозваны все» и
+     * выбрасывал игрока, который только что ввёл верный пароль. Теперь пустой
+     * результат даёт {@link SessionInvalidatedEvent.Scope#NONE}, а такое событие
+     * вовсе не публикуется: ложное приглашение обойти всех игроков сети хуже, чем
+     * его отсутствие.
+     *
+     * <p>{@code exceptPublicId == null} означает «всё, включая неизвестное этому
+     * узлу», и остаётся {@link SessionInvalidatedEvent.Scope#ALL} — но только если
+     * отзывать действительно было что.
+     */
     @Override
     public @NotNull CompletableFuture<Integer> revokeAll(long accountId,
                                                           @Nullable String exceptPublicId,
@@ -301,12 +339,29 @@ public final class SessionServiceImpl implements SessionService {
                                 .toArray(CompletableFuture[]::new);
                         return CompletableFuture.allOf(deletions).thenApply(ignored -> count);
                     })
-                    .thenCompose(count -> events
-                            .publish(exceptPublicId == null
-                                    ? SessionInvalidatedEvent.all(accountId, reason)
-                                    : new SessionInvalidatedEvent(accountId, affected, reason, now))
-                            .thenApply(ignored -> count));
+                    .thenCompose(count -> {
+                        SessionInvalidatedEvent event =
+                                invalidationOf(accountId, exceptPublicId, affected, count, reason);
+                        if (event.isNoop()) {
+                            return CompletableFuture.completedFuture(count);
+                        }
+                        return events.publish(event).thenApply(ignored -> count);
+                    });
         });
+    }
+
+    /** Собирает событие отзыва с однозначным охватом. */
+    private static SessionInvalidatedEvent invalidationOf(long accountId,
+                                                          @Nullable String exceptPublicId,
+                                                          List<String> affected,
+                                                          int revokedRows,
+                                                          String reason) {
+        if (affected.isEmpty() && revokedRows <= 0) {
+            return SessionInvalidatedEvent.none(accountId, reason);
+        }
+        return exceptPublicId == null
+                ? SessionInvalidatedEvent.all(accountId, reason)
+                : SessionInvalidatedEvent.some(accountId, affected, reason);
     }
 
     @Override
@@ -332,9 +387,18 @@ public final class SessionServiceImpl implements SessionService {
 
     // ------------------------------------------------------------------ состояние машины входа
 
+    /**
+     * Состояние машины входа.
+     *
+     * <p>Читается строго. Прежде отказ хранилища возвращал {@code CONNECTING} — то же
+     * самое, что «игрок только что подключился». Для того, кто уже вошёл, это означало
+     * потерю аутентификации на ровном месте; для маршрутизации — отправку в Limbo
+     * посреди игры. Теперь отказ виден вызывающему, и решение принимает он, а не
+     * значение по умолчанию.
+     */
     @Override
     public @NotNull CompletableFuture<AuthState> getState(@NotNull UUID playerUuid) {
-        return cache.get(CacheProvider.Keys.AUTH_STATE + playerUuid).thenApply(raw -> {
+        return cache.critical().get(CacheProvider.Keys.AUTH_STATE + playerUuid).thenApply(raw -> {
             if (raw.isEmpty()) {
                 return AuthState.CONNECTING;
             }
@@ -368,7 +432,7 @@ public final class SessionServiceImpl implements SessionService {
     }
 
     private CompletableFuture<Void> writeState(UUID playerUuid, AuthState state) {
-        return cache.set(CacheProvider.Keys.AUTH_STATE + playerUuid, state.name(),
+        return cache.critical().set(CacheProvider.Keys.AUTH_STATE + playerUuid, state.name(),
                 stateTtl(state));
     }
 

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import net.kofnetwork.auth.api.event.AuthEvent;
 import net.kofnetwork.auth.api.event.EventBus;
 import net.kofnetwork.auth.api.event.events.AccountLoginEvent;
+import net.kofnetwork.auth.api.event.events.LoginApprovalDecidedEvent;
 import net.kofnetwork.auth.api.event.events.LoginApprovalRequestedEvent;
 import net.kofnetwork.auth.api.event.events.BindingChangedEvent;
 import net.kofnetwork.auth.api.event.events.PasswordChangedEvent;
@@ -155,6 +156,12 @@ public final class RedisEventBridge implements EventBus, AutoCloseable {
     }
 
     private CompletableFuture<Void> broadcast(AuthEvent event) {
+        if (event instanceof SessionInvalidatedEvent e && e.isNoop()) {
+            // Отзыв, не затронувший ни одной сессии, ничего не сообщает соседям.
+            // Отправлять его — значит заставлять каждый узел разбирать сообщение
+            // и обходить всех игроков ради заведомо пустого результата.
+            return CompletableFuture.completedFuture(null);
+        }
         Map<String, String> envelope = describe(event);
         if (envelope == null) {
             // Тип не описан как передаваемый: отправлять «на всякий случай»
@@ -194,7 +201,12 @@ public final class RedisEventBridge implements EventBus, AutoCloseable {
 
         if (event instanceof SessionInvalidatedEvent e) {
             attributes.put("reason", e.reason());
+            // Охват уезжает отдельным полем, а не выводится из размера перечня.
+            // Получатель обязан отличать «ни одной» от «всех», а по пустой строке
+            // эти два случая неразличимы.
+            attributes.put("scope", e.scope().name());
             attributes.put("sessions", String.join(",", e.sessionPublicIds()));
+            // Оставлено для узлов прежней версии, которые читают только его.
             attributes.put("affectsAll", String.valueOf(e.affectsAll()));
             return attributes;
         }
@@ -238,6 +250,23 @@ public final class RedisEventBridge implements EventBus, AutoCloseable {
             }
             if (e.twoFactorUsed() != null) {
                 attributes.put("twoFactor", e.twoFactorUsed().name());
+            }
+            return attributes;
+        }
+        if (event instanceof LoginApprovalDecidedEvent e) {
+            // Обязательно уезжает по сети: кнопку нажимают в процессе WebAPI, а ждёт
+            // решения игрок, подключённый к Velocity. Раньше связи между ними не было
+            // вовсе, и подтвердивший вход оставался стоять в Limbo до таймаута.
+            attributes.put("username", e.username());
+            attributes.put("attemptId", e.attemptId());
+            attributes.put("approvalId", e.approvalPublicId());
+            attributes.put("platform", e.platform().name());
+            attributes.put("status", e.status().name());
+            if (e.playerUuid() != null) {
+                attributes.put("playerUuid", e.playerUuid().toString());
+            }
+            if (e.sessionPublicId() != null) {
+                attributes.put("sessionId", e.sessionPublicId());
             }
             return attributes;
         }

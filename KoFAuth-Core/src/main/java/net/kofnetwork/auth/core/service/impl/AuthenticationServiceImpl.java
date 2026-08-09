@@ -13,6 +13,9 @@ import net.kofnetwork.auth.api.event.events.PasswordChangedEvent;
 import net.kofnetwork.auth.api.event.events.SuspiciousActivityEvent;
 import net.kofnetwork.auth.api.model.Account;
 import net.kofnetwork.auth.api.model.AccountStatus;
+import net.kofnetwork.auth.api.model.BotPlatform;
+import net.kofnetwork.auth.api.model.EventSource;
+import net.kofnetwork.auth.api.model.LoginApproval;
 import net.kofnetwork.auth.api.model.LoginAttempt;
 import net.kofnetwork.auth.api.model.LoginResultType;
 import net.kofnetwork.auth.api.model.SecurityEventType;
@@ -28,12 +31,14 @@ import net.kofnetwork.auth.api.result.OperationResult;
 import net.kofnetwork.auth.api.service.AuditService;
 import net.kofnetwork.auth.api.service.AuthenticationService;
 import net.kofnetwork.auth.api.service.EmailService;
+import net.kofnetwork.auth.api.service.LoginApprovalService;
 import net.kofnetwork.auth.api.service.SecurityService;
 import net.kofnetwork.auth.api.service.SessionService;
 import net.kofnetwork.auth.api.service.TokenService;
 import net.kofnetwork.auth.api.service.TotpService;
 import net.kofnetwork.auth.core.security.PasswordHasher;
 import net.kofnetwork.auth.core.security.PasswordPolicy;
+import net.kofnetwork.auth.core.security.TokenGenerator;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -72,6 +77,7 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
     private final TokenService tokens;
     private final EmailService email;
     private final AuditService audit;
+    private final LoginApprovalService approvals;
     private final PasswordHasher hasher;
     private final PasswordPolicy policy;
     private final ConfigurationService config;
@@ -86,6 +92,7 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
                                      @NotNull TokenService tokens,
                                      @NotNull EmailService email,
                                      @NotNull AuditService audit,
+                                     @NotNull LoginApprovalService approvals,
                                      @NotNull PasswordHasher hasher,
                                      @NotNull PasswordPolicy policy,
                                      @NotNull ConfigurationService config,
@@ -99,6 +106,7 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
         this.tokens = tokens;
         this.email = email;
         this.audit = audit;
+        this.approvals = approvals;
         this.hasher = hasher;
         this.policy = policy;
         this.config = config;
@@ -270,7 +278,9 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
 
             TwoFactorMethod required = method.get();
 
-            // Код уже введён вместе с паролем — проверяем сразу.
+            // Код уже введён вместе с паролем — проверяем сразу. Это единственный
+            // оставшийся способ передать код: подтверждение через мессенджер кодов
+            // не использует вовсе, только кнопки.
             if (request.twoFactorCode() != null && required == TwoFactorMethod.TOTP) {
                 return totp.verify(account.id(), request.twoFactorCode()).thenCompose(valid -> {
                     if (!valid) {
@@ -282,42 +292,67 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
                 });
             }
 
-            // Код из бота, введённый вместе с паролем: игрок взял его командой
-            // /sendcode, потому что сообщение с кнопками не дошло. Гасим тем же
-            // consume, что и кнопка, — код одноразовый независимо от способа ввода.
-            if (request.twoFactorCode() != null) {
-                return tokens.consume(request.twoFactorCode().trim(),
-                                TokenType.LOGIN_APPROVAL, request.context().ip())
-                        .thenCompose(consumed -> {
-                            // Код должен принадлежать тому же аккаунту: иначе действующий
-                            // код одного игрока пускал бы в чужой аккаунт под его паролем.
-                            boolean valid = consumed.isSuccess()
-                                    && Long.valueOf(account.id()).equals(consumed.value().accountId());
-                            if (!valid) {
-                                return recordFailure(account.id(), request,
-                                                LoginResultType.TWO_FACTOR_FAILED)
-                                        .thenApply(ignored -> AuthResult.rejected(
-                                                LoginResultType.TWO_FACTOR_FAILED, null));
-                            }
-                            return completeLogin(account, request, device, required, newDevice);
-                        });
-            }
-
             if (required == TwoFactorMethod.TOTP) {
                 return CompletableFuture.completedFuture(
-                        AuthResult.twoFactorRequired(account, required, null));
+                        AuthResult.twoFactorRequired(account, required, null, null));
             }
 
-            // Telegram и Discord: просим бота показать владельцу кнопки.
-            //
-            // Токен подтверждения выпускает сам бот, получив это событие. Выпустить
-            // его здесь и переслать значило бы положить предъявительский код в общий
-            // канал Pub/Sub, а держать два действующих кода на один вход — расширить
-            // окно, в котором любой из них принимается.
-            return events.publish(LoginApprovalRequestedEvent.of(
-                            account.id(), account.username(), required, request.context()))
-                    .thenApply(ignored -> AuthResult.twoFactorRequired(account, required, null));
+            return requestBotApproval(account, request, required, device, newDevice);
         });
+    }
+
+    /**
+     * Просит владельца подтвердить вход кнопкой в мессенджере.
+     *
+     * <p><b>Что здесь изменилось.</b> Раньше публиковалось событие, а код подтверждения
+     * выпускал сам бот — предъявительский, ни к чему не привязанный и живущий отдельно
+     * от этой попытки входа. Теперь подтверждение выпускает сервер: оно существует
+     * только как продолжение уже проверенного пароля, знает получателя и попытку и
+     * может быть применено ровно один раз. Игроку в игре ничего вводить не нужно.
+     *
+     * <p>Если подтверждение выпустить не удалось — привязки нет либо она выключена, —
+     * вход отвергается, а не подвисает в ожидании кнопки, которую некому показать.
+     */
+    private CompletableFuture<AuthResult> requestBotApproval(
+            Account account, LoginRequest request, TwoFactorMethod required,
+            Optional<DeviceRepository.UpsertResult> device, boolean newDevice) {
+
+        Optional<BotPlatform> platform = BotPlatform.ofTwoFactorMethod(required);
+        if (platform.isEmpty()) {
+            // Второй фактор, для которого нет реализации доставки. Пропускать вход
+            // нельзя: это ровно тот fail-open, ради которого второй фактор и включают.
+            LOGGER.error("Для аккаунта {} выбран второй фактор {}, который не поддерживается",
+                    account.id(), required);
+            return CompletableFuture.completedFuture(
+                    AuthResult.rejected(LoginResultType.TWO_FACTOR_FAILED, null));
+        }
+
+        String attemptId = UUID.randomUUID().toString();
+        // Proof остаётся только в памяти вкладки и приходит по HTTPS в теле ответа.
+        // Он не передаётся боту, URL, callback_data или логам; в БД хранится hash.
+        String browserProof = request.context().source() == EventSource.WEB
+                ? TokenGenerator.randomToken() : null;
+        return approvals.request(account, request.playerUuid(), attemptId,
+                        platform.get(), request.context(),
+                        browserProof == null ? null : TokenGenerator.hash(browserProof))
+                .thenCompose(issued -> {
+                    if (issued.isFailure()) {
+                        return recordFailure(account.id(), request,
+                                        LoginResultType.TWO_FACTOR_FAILED)
+                                .thenApply(ignored -> AuthResult.rejected(
+                                        LoginResultType.TWO_FACTOR_FAILED,
+                                        issued.errorMessage()));
+                    }
+                    // Событие остаётся для локальных подписчиков — метрик и аудита.
+                    // Ботам оно больше не адресовано: они читают долговечную очередь,
+                    // которая переживает их перезапуск, а не Pub/Sub, который не помнит
+                    // ничего.
+                    return events.publish(LoginApprovalRequestedEvent.of(
+                                    account.id(), account.username(), required,
+                                    issued.value().publicId(), attemptId, request.context()))
+                            .thenApply(ignored -> AuthResult.twoFactorRequired(
+                                    account, required, attemptId, browserProof));
+                });
     }
 
     /**
@@ -370,27 +405,50 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
         // Шаг 1 обязан стоять до шага 3 по смежной причине: отзыв не может
         // исключить сессию, которой ещё нет, и объявил бы «отозваны все».
         return sessions.create(account.id(), sessionTypeFor(request), request.context(), deviceId)
-                .thenCompose(session -> cacheSessionForPlayer(request, session)
-                        .thenApply(ignored -> session))
-                .thenCompose(session -> enforceSessionLimit(account, request, session)
-                        .thenApply(ignored -> session))
-                .thenCompose(session -> accounts.updateLastLogin(account.id(), request.context().ip(),
-                                now, request.context().server(), request.context().country(),
-                                request.context().city(), request.context().userAgent())
-                        .thenApply(ignored -> session))
-                .thenCompose(session -> isNewCountry(account, request).thenCompose(newCountry ->
-                        audit.logLoginAttempt(LoginAttempt
-                                        .success(account.id(), deviceId, request.username(),
-                                                request.context().ip(), request.context().source(),
-                                                usedMethod)
-                                        .withGeo(request.context().country(),
-                                                request.context().city(), request.context().isp())
-                                        .withClient(request.context().userAgent(),
-                                                request.context().server(),
-                                                request.context().protocolVersion()))
-                                .thenCompose(x -> events.publish(AccountLoginEvent.of(account, session,
-                                        request.context(), usedMethod, newDevice, newCountry)))
-                                .thenApply(x -> AuthResult.success(account, session))));
+                .thenCompose(session -> bindOrDiscard(request, session)
+                        .thenCompose(bound -> bound
+                                ? finishLogin(account, request, session, deviceId, usedMethod, newDevice)
+                                : CompletableFuture.completedFuture(
+                                        AuthResult.error("Хранилище сессий недоступно"))));
+    }
+
+    /**
+     * Привязывает сессию к игроку либо убирает её.
+     *
+     * @return {@code false}, если привязка не удалась и сессия отозвана
+     */
+    private CompletableFuture<Boolean> bindOrDiscard(LoginRequest request, Session session) {
+        return cacheSessionForPlayer(request, session)
+                .thenApply(ignored -> true)
+                .exceptionallyCompose(failure -> discardOrphan(session, failure)
+                        .thenApply(ignored -> false));
+    }
+
+    /** Оставшиеся шаги входа: лимит сессий, отметка о входе, аудит, событие. */
+    private CompletableFuture<AuthResult> finishLogin(Account account,
+                                                       LoginRequest request,
+                                                       Session session,
+                                                       @Nullable Long deviceId,
+                                                       @Nullable TwoFactorMethod usedMethod,
+                                                       boolean newDevice) {
+        Instant now = Instant.now();
+        return enforceSessionLimit(account, request, session)
+                .thenCompose(ignored -> accounts.updateLastLogin(account.id(), request.context().ip(),
+                        now, request.context().server(), request.context().country(),
+                        request.context().city(), request.context().userAgent()))
+                .thenCompose(ignored -> isNewCountry(account, request))
+                .thenCompose(newCountry -> audit.logLoginAttempt(LoginAttempt
+                                .success(account.id(), deviceId, request.username(),
+                                        request.context().ip(), request.context().source(),
+                                        usedMethod)
+                                .withGeo(request.context().country(),
+                                        request.context().city(), request.context().isp())
+                                .withClient(request.context().userAgent(),
+                                        request.context().server(),
+                                        request.context().protocolVersion()))
+                        .thenCompose(x -> events.publish(AccountLoginEvent.of(account, session,
+                                request.context(), usedMethod, newDevice, newCountry))))
+                .thenApply(ignored -> AuthResult.success(account, session));
     }
 
     /**
@@ -402,19 +460,40 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
      * завершался. К этому моменту отзыв прежних сессий успевал разослать событие,
      * и подписчики видели устаревшую привязку.
      *
-     * <p>Для входов не из игры ({@code WEB}, {@code TELEGRAM}, бот, API) UUID
-     * отсутствует — привязывать нечего, и это не ошибка.
+     * <p><b>Отказ привязки отменяет вход.</b> Прежняя версия его лишь записывала в лог
+     * и объявляла вход успешным. Получалась сессия-сирота: строка в MySQL есть, найти
+     * её по игроку нельзя, отозвать по событию тоже нельзя — событие ищет игрока через
+     * ту самую привязку, которой не появилось. Игрок при этом считался вошедшим ровно
+     * до первого переподключения. Отменить такой вход правильнее: отказ виден сразу и
+     * лечится повтором, а не превращается в состояние, из которого система не выходит.
+     *
+     * <p>Для входов не из игры ({@code WEB}, бот, API) UUID отсутствует — привязывать
+     * нечего, и это не ошибка.
      */
     private CompletableFuture<Void> cacheSessionForPlayer(LoginRequest request, Session session) {
         UUID playerUuid = request.playerUuid();
         if (playerUuid == null) {
             return CompletableFuture.completedFuture(null);
         }
-        return sessions.cacheForPlayer(playerUuid, session)
-                .exceptionally(e -> {
-                    // Кэш недоступен — вход состоялся, но переподключение потребует
-                    // пароля заново. Отменять из-за этого успешный вход нельзя.
-                    LOGGER.warn("Не удалось привязать сессию к UUID {}", playerUuid, e);
+        return sessions.cacheForPlayer(playerUuid, session);
+    }
+
+    /**
+     * Убирает сессию, которую не удалось довести до пригодного состояния.
+     *
+     * <p>Без этого в базе остаётся действующая строка, о которой не знает ни один
+     * процесс: она не находится по игроку и молча занимает место в лимите
+     * одновременных сессий, пока не истечёт срок.
+     */
+    private CompletableFuture<Void> discardOrphan(Session session, Throwable failure) {
+        LOGGER.error("Вход отменён: не удалось привязать сессию {} к игроку",
+                session.publicId(), failure);
+        return sessions.revoke(session.publicId(), Session.REASON_LOGOUT)
+                .handle((ignored, cleanupFailure) -> {
+                    if (cleanupFailure != null) {
+                        LOGGER.error("Не удалось убрать неполную сессию {}",
+                                session.publicId(), cleanupFailure);
+                    }
                     return null;
                 });
     }
@@ -552,45 +631,39 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
         });
     }
 
+    /**
+     * Завершает вход, подтверждённый кнопкой.
+     *
+     * <p><b>Завершается именно исходная попытка.</b> Прежняя версия строила
+     * синтетический запрос из контекста мессенджера и создавала сессию типа
+     * {@code TELEGRAM} — не ту, которую ждал игрок, и не в игре. Здесь контекст
+     * восстанавливается из записи подтверждения: адрес, сервер и геоданные те же, что
+     * были у попытки, а {@code playerUuid} позволяет привязать сессию к игроку. Тип
+     * сессии выводится из контекста и для игрового входа равен {@code GAME}.
+     */
     @Override
-    public @NotNull CompletableFuture<AuthResult> completeApproval(@NotNull String approvalToken,
-                                                                    boolean approved,
-                                                                    @NotNull AuthContext context) {
-        return tokens.consume(approvalToken, TokenType.LOGIN_APPROVAL, context.ip())
-                .thenCompose(result -> {
-                    if (result.isFailure()) {
-                        return CompletableFuture.completedFuture(
-                                AuthResult.rejected(LoginResultType.TWO_FACTOR_FAILED,
-                                        result.errorMessage()));
-                    }
-                    Long accountId = result.value().accountId();
-                    if (accountId == null) {
-                        return CompletableFuture.completedFuture(AuthResult.unknownAccount());
-                    }
-                    if (!approved) {
-                        // Владелец нажал «Это не я»: сам факт важнее отказа во входе.
-                        return events.publish(SuspiciousActivityEvent.of(accountId,
-                                        SecurityEventType.LOGIN_FAILED, context,
-                                        "Владелец отклонил вход"))
-                                .thenApply(ignored -> AuthResult.rejected(
-                                        LoginResultType.TWO_FACTOR_FAILED, "Вход отклонён владельцем"));
-                    }
-                    return accounts.findById(accountId).thenCompose(found -> found
-                            .map(account -> completeLogin(account,
-                                    new LoginRequest(account.username(), "", account.uuid(),
-                                            null, context),
-                                    Optional.empty(),
-                                    approvalMethod(account), false))
-                            .orElseGet(() -> CompletableFuture.completedFuture(
-                                    AuthResult.unknownAccount())));
-                });
-    }
+    public @NotNull CompletableFuture<Optional<Session>> completeApprovedLogin(
+            @NotNull LoginApproval approval) {
 
-    private static @Nullable TwoFactorMethod approvalMethod(Account account) {
-        if (account.hasTwoFactor(TwoFactorMethod.TELEGRAM)) {
-            return TwoFactorMethod.TELEGRAM;
-        }
-        return account.hasTwoFactor(TwoFactorMethod.DISCORD) ? TwoFactorMethod.DISCORD : null;
+        return accounts.findById(approval.accountId()).thenCompose(found -> {
+            if (found.isEmpty()) {
+                LOGGER.warn("Подтверждение {} относится к исчезнувшему аккаунту {}",
+                        approval.publicId(), approval.accountId());
+                return CompletableFuture.completedFuture(Optional.<Session>empty());
+            }
+            Account account = found.get();
+            AuthContext context = new AuthContext(approval.requestIp(), approval.requestSource(),
+                    approval.requestPlatform(), approval.userAgent(), approval.deviceFingerprint(),
+                    approval.country(), approval.city(), null, approval.server(), null, null);
+
+            LoginRequest request = new LoginRequest(account.username(), "",
+                    approval.playerUuid(), null, context);
+
+            return resolveDevice(account, request).thenCompose(device -> completeLogin(account, request, device,
+                            approval.platform().asTwoFactorMethod(),
+                            device.map(DeviceRepository.UpsertResult::created).orElse(false))
+                    .thenApply(result -> Optional.ofNullable(result.session())));
+        });
     }
 
     // ================================================================ пароль

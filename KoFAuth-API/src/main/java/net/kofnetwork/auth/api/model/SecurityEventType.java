@@ -45,6 +45,23 @@ public enum SecurityEventType {
     RECOVERY_CODE_USED(Severity.CRITICAL),
     RECOVERY_CODES_REGENERATED(Severity.WARNING),
 
+    /** Владельцу отправлен запрос подтверждения входа кнопкой в мессенджере. */
+    LOGIN_APPROVAL_REQUESTED(Severity.INFO),
+
+    /** Владелец подтвердил вход. */
+    LOGIN_APPROVAL_GRANTED(Severity.INFO),
+
+    /** Владелец отклонил вход: пароль знает кто-то ещё. */
+    LOGIN_APPROVAL_DENIED(Severity.CRITICAL),
+
+    /**
+     * Кнопку подтверждения нажал не тот, кому она адресована.
+     *
+     * <p>Отдельное событие, а не {@link #LOGIN_FAILED}: означает попытку
+     * воспользоваться чужим идентификатором запроса, а не ошибку владельца.
+     */
+    LOGIN_APPROVAL_FOREIGN(Severity.CRITICAL),
+
     // --- Сессии и устройства ---
     SESSION_CREATED(Severity.INFO),
     SESSION_REVOKED(Severity.INFO),

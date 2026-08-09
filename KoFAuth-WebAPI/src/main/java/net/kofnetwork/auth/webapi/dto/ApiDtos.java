@@ -69,6 +69,12 @@ public final class ApiDtos {
     public record CaptchaBody(@NotBlank String challengeId, @NotBlank String answer) {
     }
 
+    /** Данные остаются только в памяти исходной вкладки и передаются POST-телом. */
+    public record ApprovalPollBody(
+            @NotBlank @Size(min = 36, max = 36) String attemptId,
+            @NotBlank @Size(min = 64, max = 64) String browserProof) {
+    }
+
     // ------------------------------------------------------------------ ответы
 
     @Schema(description = "Пара токенов доступа")
@@ -144,9 +150,21 @@ public final class ApiDtos {
     }
 
     @Schema(description = "Требуется второй фактор")
+    /**
+     * @param attemptId метка попытки, ожидающей подтверждения в мессенджере.
+     *                  Это не токен: ею нельзя войти. Решение принимает владелец
+     *                  кнопки, и сервер сверяет его по идентификатору мессенджера,
+     *                  а не по знанию этой строки
+     */
     public record TwoFactorRequiredResponse(
             String status,
             @Schema(example = "TOTP") String method,
-            @Schema(description = "Токен подтверждения для Telegram и Discord") String approvalToken) {
+            @Schema(description = "Метка попытки для Telegram и Discord; для TOTP пусто")
+            String attemptId,
+            @Schema(description = "Секрет только для исходной WEB-вкладки; не URL и не токен сессии")
+            String browserProof) {
+    }
+
+    public record ApprovalStatusResponse(String status, boolean ready) {
     }
 }

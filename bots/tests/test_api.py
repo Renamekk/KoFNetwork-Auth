@@ -5,7 +5,6 @@ from __future__ import annotations
 import httpx
 import pytest
 import respx
-
 from kofauth_common.api import ApiUnavailable, KoFAuthApi
 from kofauth_common.config import ApiSettings, ConfigurationError
 

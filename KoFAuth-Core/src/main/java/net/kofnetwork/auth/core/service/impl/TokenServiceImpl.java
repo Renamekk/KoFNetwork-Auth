@@ -89,15 +89,11 @@ public final class TokenServiceImpl implements TokenService {
                     config.getInt(ConfigFile.TELEGRAM, "link.code-length", 8));
             case EMAIL_VERIFY, PASSWORD_RESET -> TokenGenerator.numericCode(
                     config.getInt(ConfigFile.MAIL, "verification.code-length", 6));
-            // Код подтверждения входа человек либо нажимает кнопкой, либо вводит
-            // руками после /sendcode — отсюда читаемый алфавит вместо 64 знаков hex.
-            //
-            // Длина ограничена и сверху: код едет в callback_data кнопки Telegram,
-            // а туда помещается 64 байта вместе с префиксом. Значение по умолчанию
-            // даёт 50 бит, чего достаточно при сроке жизни в две минуты и при том,
-            // что это второй фактор — пароль к этому моменту уже проверен.
-            case LOGIN_APPROVAL -> TokenGenerator.humanReadableCode(
-                    config.getInt(ConfigFile.SECURITY, "two-factor.approval-code-length", 10));
+            // LOGIN_APPROVAL здесь больше не выпускается. Подтверждение входа
+            // перестало быть предъявительским кодом: его выпускает сервер после
+            // проверки пароля, оно связано с попыткой и получателем и живёт в
+            // таблице login_approvals. Значение перечисления сохранено ради
+            // совместимости со схемой и старыми строками.
             default -> TokenGenerator.randomToken();
         };
 
@@ -111,35 +107,41 @@ public final class TokenServiceImpl implements TokenService {
         return tokens.insert(token).thenApply(saved -> new IssuedToken(raw, saved));
     }
 
+    /**
+     * Гасит одноразовый токен.
+     *
+     * <p><b>Проверка и пометка — одна операция.</b> Прежняя версия читала строку,
+     * убеждалась, что токен не использован, не отозван и не истёк, и только потом
+     * помечала его. Между чтением и пометкой помещался второй запрос с тем же кодом:
+     * он видел ту же пригодную строку и тоже шёл дальше. Проигравший узнавал об этом
+     * лишь по нулю изменённых строк, но к тому моменту уже мог, например, завершить
+     * вход. Теперь всё условие живёт в {@code WHERE} одного {@code UPDATE}
+     * ({@link net.kofnetwork.auth.api.repository.TokenRepository#consumeByHash}),
+     * и второй запрос проигрывает до того, как что-либо предпримет.
+     */
     @Override
     public @NotNull CompletableFuture<OperationResult<AuthToken>> consume(@NotNull String rawValue,
                                                                            @NotNull TokenType expectedType,
                                                                            @Nullable IpAddress ip) {
-        return tokens.findByHash(TokenGenerator.hash(rawValue)).thenCompose(found -> {
-            if (found.isEmpty()) {
-                return completed(OperationResult.fail("TOKEN_NOT_FOUND", "Токен не найден"));
-            }
-            AuthToken token = found.get();
-            if (token.type() != expectedType) {
-                // Токен одного назначения не должен работать в другом: код привязки
-                // Telegram не может сбросить пароль.
-                return completed(OperationResult.fail("TOKEN_WRONG_TYPE",
-                        "Токен предназначен для другой операции"));
-            }
-            if (token.revoked()) {
-                return completed(OperationResult.fail("TOKEN_REVOKED", "Токен отозван"));
-            }
-            if (token.isExpired(Instant.now())) {
-                return completed(OperationResult.fail("TOKEN_EXPIRED", "Срок действия истёк"));
-            }
-            if (token.isReplay()) {
-                return handleReplay(token);
-            }
-            // Пометка атомарна: два параллельных запроса с одним кодом не пройдут оба.
-            return tokens.markUsed(token.id(), Instant.now(), ip).thenApply(marked -> marked
-                    ? OperationResult.ok(token)
-                    : OperationResult.fail("TOKEN_ALREADY_USED", "Токен уже использован"));
-        });
+        return tokens.consumeByHash(TokenGenerator.hash(rawValue), expectedType, Instant.now(), ip)
+                .thenCompose(outcome -> switch (outcome.status()) {
+                    case CONSUMED -> completed(OperationResult.ok(outcome.token()));
+                    case NOT_FOUND -> completed(OperationResult.fail(
+                            "TOKEN_NOT_FOUND", "Токен не найден"));
+                    // Токен одного назначения не должен работать в другом: код
+                    // привязки Telegram не может сбросить пароль.
+                    case WRONG_TYPE -> completed(OperationResult.fail(
+                            "TOKEN_WRONG_TYPE", "Токен предназначен для другой операции"));
+                    case REVOKED -> completed(OperationResult.fail(
+                            "TOKEN_REVOKED", "Токен отозван"));
+                    case EXPIRED -> completed(OperationResult.fail(
+                            "TOKEN_EXPIRED", "Срок действия истёк"));
+                    // Повторное предъявление одноразового токена неотличимо от утечки.
+                    case ALREADY_USED -> outcome.token() == null
+                            ? completed(OperationResult.fail(
+                                    "TOKEN_ALREADY_USED", "Токен уже использован"))
+                            : handleReplay(outcome.token());
+                });
     }
 
     /** Повторное использование одноразового токена — сигнал об утечке. */
@@ -200,36 +202,38 @@ public final class TokenServiceImpl implements TokenService {
         return config.getDuration(ConfigFile.SECURITY, "jwt.refresh-lifetime", Duration.ofDays(30));
     }
 
+    /**
+     * Обменивает refresh-токен на новую пару.
+     *
+     * <p>Погашение прежнего звена атомарно по той же причине, что и в
+     * {@link #consume}: два одновременных обновления с одним токеном обязаны
+     * разойтись на «выиграл» и «повтор», а не оба выпустить по новой паре.
+     */
     @Override
     public @NotNull CompletableFuture<OperationResult<TokenPair>> refresh(@NotNull String refreshToken,
                                                                            @Nullable IpAddress ip) {
-        return tokens.findByHash(TokenGenerator.hash(refreshToken)).thenCompose(found -> {
-            if (found.isEmpty() || found.get().type() != TokenType.REFRESH) {
-                return completed(OperationResult.fail("TOKEN_NOT_FOUND", "Refresh-токен не найден"));
-            }
-            AuthToken token = found.get();
-
-            if (token.isReplay()) {
-                return handleReplay(token).thenApply(OperationResult::propagateFailure);
-            }
-            if (!token.isUsable(Instant.now())) {
-                return completed(OperationResult.fail("TOKEN_UNUSABLE",
-                        "Refresh-токен недействителен"));
-            }
-            Long accountId = token.accountId();
-            if (accountId == null) {
-                return completed(OperationResult.fail("TOKEN_INVALID",
-                        "Токен не связан с аккаунтом"));
-            }
-
-            return tokens.markUsed(token.id(), Instant.now(), ip).thenCompose(marked -> {
-                if (!marked) {
-                    return completed(OperationResult.<TokenPair>fail("TOKEN_ALREADY_USED",
-                            "Refresh-токен уже использован"));
-                }
-                return rotate(token, accountId, ip);
-            });
-        });
+        return tokens.consumeByHash(TokenGenerator.hash(refreshToken), TokenType.REFRESH,
+                        Instant.now(), ip)
+                .thenCompose(outcome -> switch (outcome.status()) {
+                    case CONSUMED -> {
+                        AuthToken token = outcome.token();
+                        Long accountId = token == null ? null : token.accountId();
+                        yield accountId == null
+                                ? completed(OperationResult.<TokenPair>fail("TOKEN_INVALID",
+                                        "Токен не связан с аккаунтом"))
+                                : rotate(token, accountId, ip);
+                    }
+                    // Предъявлен уже погашенный токен: либо повтор запроса, либо утечка.
+                    // Различить нельзя, поэтому отзывается вся цепочка.
+                    case ALREADY_USED -> outcome.token() == null
+                            ? completed(OperationResult.<TokenPair>fail("TOKEN_ALREADY_USED",
+                                    "Refresh-токен уже использован"))
+                            : handleReplay(outcome.token()).thenApply(OperationResult::propagateFailure);
+                    case NOT_FOUND, WRONG_TYPE -> completed(OperationResult.fail(
+                            "TOKEN_NOT_FOUND", "Refresh-токен не найден"));
+                    case REVOKED, EXPIRED -> completed(OperationResult.fail(
+                            "TOKEN_UNUSABLE", "Refresh-токен недействителен"));
+                });
     }
 
     /** Выпускает новую пару, связывая refresh с предыдущим звеном цепочки. */

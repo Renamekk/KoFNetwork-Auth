@@ -135,6 +135,81 @@ public final class JdbcTokenRepository implements TokenRepository {
         ).thenApply(affected -> affected > 0);
     }
 
+    /**
+     * Погашение одним {@code UPDATE}: проверка и пометка неразделимы.
+     *
+     * <p>Условие содержит всё, что раньше проверялось отдельными чтениями, — тип,
+     * {@code used = 0}, {@code revoked = 0} и срок. Между проверкой и пометкой больше
+     * нет момента, в который второй запрос увидел бы токен пригодным. При нулевом
+     * числе изменённых строк выполняется диагностическое чтение: оно объясняет отказ,
+     * но ничего не разрешает.
+     *
+     * <p>Обе команды идут одним соединением в транзакции, чтобы диагностическое чтение
+     * видело результат собственного {@code UPDATE}, а не состояние до него.
+     */
+    @Override
+    public @NotNull CompletableFuture<ConsumeOutcome> consumeByHash(@NotNull String tokenHash,
+                                                                     @NotNull TokenType expectedType,
+                                                                     @NotNull Instant at,
+                                                                     @Nullable IpAddress ip) {
+        return sql.transaction(connection -> {
+            try (java.sql.PreparedStatement update = connection.prepareStatement("""
+                    UPDATE tokens SET used = 1, used_at = ?, used_ip = ?
+                    WHERE token_hash = ? AND type = ? AND used = 0 AND revoked = 0
+                      AND expires_at > ?
+                    """)) {
+                update.setObject(1, SqlTypes.toTimestamp(at));
+                update.setObject(2, SqlTypes.ipToBytes(ip));
+                update.setString(3, tokenHash);
+                update.setString(4, expectedType.name());
+                update.setObject(5, SqlTypes.toTimestamp(at));
+
+                boolean won = update.executeUpdate() > 0;
+                Optional<AuthToken> row = readByHash(connection, tokenHash);
+
+                if (won) {
+                    return new ConsumeOutcome(ConsumeStatus.CONSUMED, row.orElse(null));
+                }
+                return new ConsumeOutcome(explain(row, expectedType, at), row.orElse(null));
+            }
+        });
+    }
+
+    /** Читает строку токена тем же соединением, что выполняло погашение. */
+    private static Optional<AuthToken> readByHash(java.sql.Connection connection, String tokenHash)
+            throws SQLException {
+        try (java.sql.PreparedStatement select = connection.prepareStatement(
+                "SELECT " + COLUMNS + " FROM tokens WHERE token_hash = ?")) {
+            select.setString(1, tokenHash);
+            try (ResultSet rs = select.executeQuery()) {
+                return rs.next() ? Optional.of(map(rs)) : Optional.empty();
+            }
+        }
+    }
+
+    /**
+     * Почему {@code UPDATE} не изменил ни одной строки.
+     *
+     * <p>Порядок проверок повторяет порядок условий запроса, поэтому объяснение
+     * не может разойтись с решением.
+     */
+    private static ConsumeStatus explain(Optional<AuthToken> row, TokenType expectedType, Instant at) {
+        if (row.isEmpty()) {
+            return ConsumeStatus.NOT_FOUND;
+        }
+        AuthToken token = row.get();
+        if (token.type() != expectedType) {
+            return ConsumeStatus.WRONG_TYPE;
+        }
+        if (token.revoked()) {
+            return ConsumeStatus.REVOKED;
+        }
+        if (token.isExpired(at)) {
+            return ConsumeStatus.EXPIRED;
+        }
+        return ConsumeStatus.ALREADY_USED;
+    }
+
     @Override
     public @NotNull CompletableFuture<Boolean> revoke(long tokenId, @NotNull Instant at) {
         return sql.update("UPDATE tokens SET revoked = 1, revoked_at = ? WHERE id = ? AND revoked = 0",
