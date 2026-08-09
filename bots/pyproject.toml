@@ -1,0 +1,46 @@
+# =============================================================================
+#  KoF Network — монорепозиторий ботов
+#
+#  Два приложения (Telegram, Discord) и один общий пакет. Монорепозиторий,
+#  а не два отдельных проекта, потому что почти всё у ботов общее: клиент REST,
+#  подписка на события, тексты и форматирование. Разделены только меню —
+#  единственное, чем платформы действительно различаются.
+# =============================================================================
+
+[project]
+name = "kofauth-bots"
+version = "1.0.0"
+description = "Боты KoF Network: Telegram и Discord"
+requires-python = ">=3.10"
+dependencies = [
+    "kofauth-common",
+    "kofauth-telegram-bot",
+    "kofauth-discord-bot",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+    "ruff>=0.7",
+]
+
+[tool.uv.workspace]
+members = ["packages/*", "apps/*"]
+
+[tool.uv.sources]
+kofauth-common = { workspace = true }
+kofauth-telegram-bot = { workspace = true }
+kofauth-discord-bot = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]

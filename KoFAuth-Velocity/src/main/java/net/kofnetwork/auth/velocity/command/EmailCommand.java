@@ -187,9 +187,9 @@ public final class EmailCommand implements SimpleCommand {
                 player.getClientBrand());
     }
 
+    /** Строка, собранная на месте, с общим префиксом сети. */
     private Component prefixed(String text) {
-        return messages.parse(core.config().getString(
-                net.kofnetwork.auth.api.config.ConfigFile.CONFIG, "messages.prefix", "") + text);
+        return messages.prefixedRaw(text);
     }
 
     /**
@@ -201,12 +201,10 @@ public final class EmailCommand implements SimpleCommand {
     @Override
     public List<String> suggest(Invocation invocation) {
         String[] args = invocation.arguments();
-        if (args.length <= 1) {
-            String prefix = args.length == 0 ? "" : args[0].toLowerCase(Locale.ROOT);
-            return List.of("verify", "resend", "unlink").stream()
-                    .filter(name -> name.startsWith(prefix))
-                    .toList();
+        if (Suggestions.depth(args) != 1) {
+            return List.of();
         }
-        return List.of();
+        return Suggestions.matching(
+                List.of("verify", "resend", "unlink"), Suggestions.partial(args));
     }
 }

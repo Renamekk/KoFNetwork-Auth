@@ -18,8 +18,6 @@ COPY KoFAuth-Core/pom.xml KoFAuth-Core/
 COPY KoFAuth-Velocity/pom.xml KoFAuth-Velocity/
 COPY KoFAuth-Paper/pom.xml KoFAuth-Paper/
 COPY KoFAuth-WebAPI/pom.xml KoFAuth-WebAPI/
-COPY KoFAuth-Telegram/pom.xml KoFAuth-Telegram/
-COPY KoFAuth-Discord/pom.xml KoFAuth-Discord/
 
 RUN chmod +x mvnw && ./mvnw -B -q dependency:go-offline -DskipTests || true
 

@@ -352,11 +352,26 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
         Long deviceId = device.map(result -> result.device().id()).orElse(null);
         Instant now = Instant.now();
 
-        // Порядок важен: сначала создаём новую сессию, потом отзываем прежние,
-        // исключая её. В обратном порядке отзыв не может назвать новую сессию —
-        // её ещё нет, — и событие получается «отозваны все», по которому прокси
-        // выбрасывает игрока, только что успешно введшего пароль.
+        // Порядок важен и состоит из трёх шагов.
+        //
+        // 1. Создаём новую сессию.
+        // 2. Привязываем к ней UUID игрока.
+        // 3. Только теперь отзываем прежние сессии, исключая новую.
+        //
+        // Шаг 2 обязан стоять до шага 3. Отзыв публикует SessionInvalidatedEvent,
+        // на который прокси отвечает проверкой «какая сессия у этого игрока
+        // сейчас». Пока привязка указывает на прежнюю сессию, ответом будет
+        // именно она — та, которую отзыв и называет, — и прокси отключает игрока,
+        // только что успешно введшего пароль, с сообщением «Ваша сессия
+        // завершена». Игрок видел это как кик сразу после /login; со второй
+        // попытки вход проходил, потому что привязка к тому моменту уже
+        // указывала на новую сессию.
+        //
+        // Шаг 1 обязан стоять до шага 3 по смежной причине: отзыв не может
+        // исключить сессию, которой ещё нет, и объявил бы «отозваны все».
         return sessions.create(account.id(), sessionTypeFor(request), request.context(), deviceId)
+                .thenCompose(session -> cacheSessionForPlayer(request, session)
+                        .thenApply(ignored -> session))
                 .thenCompose(session -> enforceSessionLimit(account, request, session)
                         .thenApply(ignored -> session))
                 .thenCompose(session -> accounts.updateLastLogin(account.id(), request.context().ip(),
@@ -379,6 +394,32 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
     }
 
     /**
+     * Привязывает UUID игрока к выданной сессии.
+     *
+     * <p>Без этой привязки {@code validate(uuid, ip)} не находит сессию, и игрок
+     * вводит пароль при каждом переподключении. Раньше её ставил вызывающий —
+     * команда {@code /login} на прокси — уже после того, как {@link #login}
+     * завершался. К этому моменту отзыв прежних сессий успевал разослать событие,
+     * и подписчики видели устаревшую привязку.
+     *
+     * <p>Для входов не из игры ({@code WEB}, {@code TELEGRAM}, бот, API) UUID
+     * отсутствует — привязывать нечего, и это не ошибка.
+     */
+    private CompletableFuture<Void> cacheSessionForPlayer(LoginRequest request, Session session) {
+        UUID playerUuid = request.playerUuid();
+        if (playerUuid == null) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return sessions.cacheForPlayer(playerUuid, session)
+                .exceptionally(e -> {
+                    // Кэш недоступен — вход состоялся, но переподключение потребует
+                    // пароля заново. Отменять из-за этого успешный вход нельзя.
+                    LOGGER.warn("Не удалось привязать сессию к UUID {}", playerUuid, e);
+                    return null;
+                });
+    }
+
+    /**
      * Соблюдает лимит одновременных игровых сессий.
      *
      * <p>Старые сессии отзываются, а не отвергается новая: игрок, у которого
@@ -387,6 +428,12 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
      * <p>Только что созданная сессия исключается по имени. Без этого отзыв
      * объявлялся бы «все сессии аккаунта», и подписчики — прежде всего прокси —
      * не могли бы отличить прежние соединения от текущего.
+     *
+     * <p><b>Лимит именно соблюдается, а не игнорируется.</b> Прежняя версия при
+     * любом {@code max >= 1} отзывала все прежние сессии, то есть вела себя как
+     * {@code max-concurrent: 1} независимо от настройки. Теперь отзываются только
+     * лишние — самые давно не активные, — а {@code max - 1} прежних сессий
+     * остаются жить рядом с новой.
      *
      * @param current сессия, выданная этому входу
      */
@@ -398,10 +445,40 @@ public final class AuthenticationServiceImpl implements AuthenticationService {
         }
         int max = config.getInt(ConfigFile.CONFIG, "auth.session.max-concurrent", 1);
         if (max <= 0) {
+            // Ноль и меньше означает «без ограничения»: отзывать нечего.
             return CompletableFuture.completedFuture(null);
         }
-        return sessions.revokeAll(account.id(), current.publicId(), Session.REASON_LOGOUT_ALL)
-                .thenApply(ignored -> null);
+        if (max == 1) {
+            // Частый случай, для которого хватает одного запроса вместо выборки.
+            return sessions.revokeAll(account.id(), current.publicId(), Session.REASON_LOGOUT_ALL)
+                    .thenApply(ignored -> null);
+        }
+        return revokeOldestBeyondLimit(account, current, max);
+    }
+
+    /** Отзывает прежние игровые сессии сверх лимита, начиная с самых давних. */
+    private CompletableFuture<Void> revokeOldestBeyondLimit(Account account,
+                                                            Session current,
+                                                            int max) {
+        return sessions.listSessions(account.id(), current.publicId()).thenCompose(active -> {
+            List<String> others = active.stream()
+                    .filter(dto -> dto.type() == SessionType.GAME)
+                    .filter(dto -> !dto.publicId().equals(current.publicId()))
+                    // Самые свежие — в начале; отзываем хвост.
+                    .sorted(java.util.Comparator.comparing(
+                            net.kofnetwork.auth.api.dto.SessionDto::lastSeenAt).reversed())
+                    .map(net.kofnetwork.auth.api.dto.SessionDto::publicId)
+                    .skip(Math.max(0, max - 1L))
+                    .toList();
+
+            if (others.isEmpty()) {
+                return CompletableFuture.completedFuture(null);
+            }
+            CompletableFuture<?>[] revocations = others.stream()
+                    .map(publicId -> sessions.revoke(publicId, Session.REASON_LOGOUT_ALL))
+                    .toArray(CompletableFuture[]::new);
+            return CompletableFuture.allOf(revocations);
+        });
     }
 
     private CompletableFuture<Boolean> isNewCountry(Account account, LoginRequest request) {

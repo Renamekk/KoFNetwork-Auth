@@ -153,10 +153,19 @@ public final class LoginCommand implements SimpleCommand {
         }
     }
 
+    /**
+     * Завершение успешного входа.
+     *
+     * <p>Привязку UUID к сессии здесь не ставим — её записывает Core внутри
+     * {@code login()}, до рассылки событий об отзыве прежних сессий. Делать это
+     * тут значило бы опоздать: событие уже ушло бы с устаревшей привязкой.
+     *
+     * <p>Состояние задаётся через {@code resetState}: пароль принят, и остаток
+     * прошлого состояния (например {@code BLOCKED} после отзыва сессии) не должен
+     * отменять только что состоявшийся вход.
+     */
     private void onSuccess(Player player, AuthResult result) {
-        core.sessions().setState(player.getUniqueId(), AuthState.AUTHENTICATED)
-                .thenCompose(ignored -> core.sessions()
-                        .cacheForPlayer(player.getUniqueId(), result.session()))
+        core.sessions().resetState(player.getUniqueId(), AuthState.AUTHENTICATED)
                 .thenRun(() -> {
                     player.sendMessage(messages.prefixed("login-success",
                             "<green>Вход выполнен. Приятной игры!"));

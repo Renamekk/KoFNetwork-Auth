@@ -7,6 +7,7 @@ import com.velocitypowered.api.event.connection.DisconnectEvent;
 import com.velocitypowered.api.event.connection.PostLoginEvent;
 import com.velocitypowered.api.event.connection.PreLoginEvent;
 import com.velocitypowered.api.event.player.PlayerChatEvent;
+import com.velocitypowered.api.event.player.ServerConnectedEvent;
 import com.velocitypowered.api.event.player.ServerPreConnectEvent;
 import com.velocitypowered.api.event.command.CommandExecuteEvent;
 import com.velocitypowered.api.proxy.Player;
@@ -97,6 +98,17 @@ public final class AuthenticationListener {
      * <p>Событие выполняется вне сетевого потока, поэтому блокировка допустима:
      * тормозится вход одного игрока, а не работа прокси. Так же поступает
      * {@link #onPreLogin(PreLoginEvent)}.
+     *
+     * <p><b>Состояние задаётся, а не меняется.</b> Используется
+     * {@link net.kofnetwork.auth.api.service.SessionService#resetState} — новое
+     * соединение начинает машину входа с нуля. Прежний вариант вызывал
+     * {@code setState}, который отвергает переход из терминальных состояний
+     * {@code AUTHENTICATED} и {@code BLOCKED}. Запись о прошлом входе переживает
+     * соединение (разрыв связи доходит до прокси не всегда, а сам прокси может
+     * быть перезапущен), поэтому у вернувшегося игрока с истёкшей сессией переход
+     * «нужен пароль» отвергался, состояние оставалось {@code AUTHENTICATED} —
+     * и {@link #onServerPreConnect} отправлял его мимо Limbo прямо на игровой
+     * сервер, где бэкенд, не найдя сессии, отключал его с ошибкой.
      */
     @Subscribe(order = PostOrder.EARLY)
     public void onPostLogin(PostLoginEvent event) {
@@ -111,20 +123,21 @@ public final class AuthenticationListener {
                             // Действующая сессия: игрок продолжает с того же места,
                             // повторный ввод пароля после разрыва соединения раздражает
                             // и ничего не добавляет к безопасности.
-                            return core.sessions().setState(uuid, AuthState.AUTHENTICATED);
+                            return core.sessions().resetState(uuid, AuthState.AUTHENTICATED);
                         }
                         return core.authentication().findAccount(player.getUsername())
-                                .thenCompose(account -> core.sessions().setState(uuid,
+                                .thenCompose(account -> core.sessions().resetState(uuid,
                                         account.isPresent()
                                                 ? AuthState.AWAITING_LOGIN
                                                 : AuthState.AWAITING_REGISTER));
                     })
                     .join();
         } catch (RuntimeException e) {
-            // Состояние не определилось — игрок останется в CONNECTING и попадёт
-            // в Limbo. Это безопасный исход: пустит его только пароль.
+            // Состояние не определилось. Явно ставим CONNECTING: остаток прошлого
+            // входа мог бы оказаться AUTHENTICATED и пропустить игрока дальше.
             logger.error("Не удалось определить состояние игрока {}",
                     player.getUsername(), e);
+            core.sessions().resetState(uuid, AuthState.CONNECTING);
         }
     }
 
@@ -232,24 +245,53 @@ public final class AuthenticationListener {
         player.sendMessage(promptFor(state));
     }
 
-    /** Очистка состояния при отключении. */
+    /**
+     * Фиксирует переход игрока на другой сервер сети.
+     *
+     * <p>Помимо записи текущего сервера это единственное место, где сессия
+     * продлевается событием, а не таймером, — переключение сервера гарантированно
+     * означает живого игрока.
+     */
+    @Subscribe
+    public void onServerConnected(ServerConnectedEvent event) {
+        Player player = event.getPlayer();
+        String server = event.getServer().getServerInfo().getName();
+
+        core.sessions().currentPublicId(player.getUniqueId())
+                .thenCompose(publicId -> publicId
+                        .map(id -> core.sessions().updateServer(id, server))
+                        .orElseGet(() -> java.util.concurrent.CompletableFuture.completedFuture(null)))
+                .exceptionally(e -> {
+                    logger.warn("Не удалось записать сервер игрока {}", player.getUsername(), e);
+                    return null;
+                });
+    }
+
+    /**
+     * Очистка при отключении.
+     *
+     * <p><b>Состояние машины входа намеренно не удаляется.</b> Раньше здесь
+     * вызывался {@code clearState}, и это была гонка: обработчик отключения
+     * асинхронный, а игрок может переподключиться раньше, чем цепочка дойдёт до
+     * Redis. Тогда удаление приходило уже после того, как {@link #onPostLogin}
+     * записал состояние нового соединения, и стирало именно его — вернувшийся
+     * игрок с действующей сессией оказывался в Limbo и был вынужден вводить
+     * пароль заново.
+     *
+     * <p>Удалять и незачем: у записи есть срок жизни, а каждое новое подключение
+     * всё равно перезаписывает её через
+     * {@link net.kofnetwork.auth.api.service.SessionService#resetState}.
+     * Капча — другое дело: незакрытая задача переживает соединение, и ответ на
+     * неё игрок уже не увидит, поэтому её гасим.
+     */
     @Subscribe
     public void onDisconnect(DisconnectEvent event) {
         UUID uuid = event.getPlayer().getUniqueId();
 
         core.sessions().getState(uuid)
-                .thenCompose(state -> {
-                    if (state.isAuthenticated()) {
-                        // Сессия остаётся: игрок вернётся и продолжит без пароля.
-                        // Снимается только состояние машины входа.
-                        return core.sessions().clearState(uuid);
-                    }
-                    // Незавершённый вход: гасим ещё и незакрытую капчу, иначе
-                    // при переподключении игрок получит задачу, ответ на которую
-                    // потерялся вместе с прошлой сессией.
-                    return core.captcha().cancel(uuid)
-                            .thenCompose(ignored -> core.sessions().clearState(uuid));
-                })
+                .thenCompose(state -> state.isAuthenticated()
+                        ? java.util.concurrent.CompletableFuture.<Void>completedFuture(null)
+                        : core.captcha().cancel(uuid).thenApply(ignored -> null))
                 .exceptionally(e -> {
                     logger.warn("Не удалось очистить состояние игрока {}", uuid, e);
                     return null;

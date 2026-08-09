@@ -181,8 +181,32 @@ public final class RegistrationServiceImpl implements RegistrationService {
                 .thenCompose(saved -> grantDefaultRole(saved).thenApply(ignored -> saved))
                 .thenCompose(saved -> sessionService
                         .create(saved.id(), sessionTypeFor(request), request.context(), null)
-                        .thenApply(session -> finish(saved, session, request)))
+                        .thenCompose(session -> cacheSessionForPlayer(request, session)
+                                .thenApply(ignored -> finish(saved, session, request))))
                 .exceptionally(e -> translateFailure(e, request));
+    }
+
+    /**
+     * Привязывает UUID игрока к выданной сессии.
+     *
+     * <p>Привязку ставит Core, а не вызывающая команда: иначе между «регистрация
+     * завершена» и «привязка записана» существует окно, в котором игрок уже
+     * считается вошедшим, но его сессию по UUID никто найти не может. Для входов
+     * не из игры UUID отсутствует, и привязывать нечего.
+     */
+    private CompletableFuture<Void> cacheSessionForPlayer(RegistrationRequest request,
+                                                          Session session) {
+        UUID playerUuid = request.playerUuid();
+        if (playerUuid == null) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return sessionService.cacheForPlayer(playerUuid, session)
+                .exceptionally(e -> {
+                    // Кэш недоступен: аккаунт создан, но переподключение потребует
+                    // пароля. Отменять из-за этого регистрацию нельзя.
+                    LOGGER.warn("Не удалось привязать сессию к UUID {}", playerUuid, e);
+                    return null;
+                });
     }
 
     private CompletableFuture<Void> grantDefaultRole(Account account) {

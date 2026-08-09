@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kofauth-telegram-bot"
+version = "1.0.0"
+description = "Telegram-бот KoF Network"
+requires-python = ">=3.10"
+dependencies = [
+    "kofauth-common",
+    "aiogram>=3.13",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["telegram_bot"]

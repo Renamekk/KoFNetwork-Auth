@@ -61,6 +61,9 @@ x-kofauth-env: &kofauth-env
   KOFAUTH_TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
   KOFAUTH_DISCORD_ENABLED: ${DISCORD_ENABLED:-false}
   KOFAUTH_DISCORD_BOT_GUILD_ID: ${DISCORD_GUILD_ID:-}
+  # Ключ доступа ботов к /api/bot. Нужен именно webapi — он эту поверхность
+  # и обслуживает. Пустое значение выключает её целиком, а не открывает.
+  KOFAUTH_SECURITY_BOT_API_KEY: ${BOT_API_KEY:-}
   # Подробность логов процессов KoFAuth: INFO, DEBUG, WARN.
   # DEBUG включают на время разбора и снимают: он пишет каждое обращение к базе.
   KOFAUTH_LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -71,6 +74,33 @@ x-logging: &logging
   options:
     max-size: "10m"
     max-file: "5"
+
+# Настройки, нужные ботам. Их набор намеренно узкий: бот знает адрес REST,
+# ключ доступа к нему и канал событий — и ничего о базе.
+x-bot-env: &bot-env
+  KOFAUTH_API_URL: http://webapi:8080
+  KOFAUTH_SECURITY_BOT_API_KEY: ${BOT_API_KEY:?нет в .env — запустите ./install.sh}
+  # Пароль обязателен: redis-server запущен с requirepass. Без него
+  # подписка отвергается, и боты работают без уведомлений.
+  KOFAUTH_REDIS_URL: redis://:${REDIS_PASSWORD:?нет в .env}@redis:6379/0
+  KOFAUTH_EVENT_CHANNEL: kofauth:events
+  KOFAUTH_PANEL_URL: ${PANEL_URL:-http://127.0.0.1:8080}
+  KOFAUTH_LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  TZ: UTC
+
+# Общий шаблон бота на Python.
+x-python-bot: &python-bot
+  build:
+    context: ../bots
+    dockerfile: docker/Dockerfile
+  image: kofauth/bots:1.0.0
+  restart: unless-stopped
+  depends_on:
+    webapi: {condition: service_healthy}
+    redis: {condition: service_healthy}
+  networks: [kofauth]
+  logging: *logging
+
 
 # Общий шаблон java-процесса: jar монтируется готовым, образ пересобирать не нужно.
 x-java-service: &java-service
@@ -346,44 +376,30 @@ services:
 
   # =========================================================== боты
 
-  # Профиля два: telegram — только этот бот, bots — оба сразу.
-  # Служба поднимается, если включён любой из них.
+  # Боты написаны на Python и живут в ../bots. С Core они говорят только
+  # через REST (/api/bot) и слушают общий канал событий в Redis — доступа
+  # к MySQL у них нет намеренно: логика безопасности существует в одном
+  # экземпляре, внутри Core.
+  #
+  # Образ один на обоих: различие сводится к запускаемому модулю.
   telegram:
-    <<: *java-service
+    <<: *python-bot
     profiles: [bots, telegram]
-    depends_on:
-      webapi: {condition: service_healthy}
     environment:
-      <<: *kofauth-env
-      KOFAUTH_TELEGRAM_ENABLED: "true"
+      <<: *bot-env
       # Без токена процесс сам напишет в лог, чего не хватает, и завершится.
       KOFAUTH_TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       KOFAUTH_TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
-      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=70 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -Duser.timezone=UTC
-    command: ["java", "-jar", "/app/app.jar", "/app/config"]
-    volumes:
-      - ./artifacts/kofauth-telegram.jar:/app/app.jar:ro
-      - ./data/config:/app/config
+    command: ["python", "-m", "telegram_bot"]
 
   discord:
-    <<: *java-service
+    <<: *python-bot
     profiles: [bots, discord]
-    depends_on:
-      webapi: {condition: service_healthy}
     environment:
-      <<: *kofauth-env
-      KOFAUTH_DISCORD_ENABLED: "true"
+      <<: *bot-env
       KOFAUTH_DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
-      KOFAUTH_DISCORD_BOT_GUILD_ID: ${DISCORD_GUILD_ID:-}
-      KOFAUTH_DISCORD_OAUTH_ENABLED: ${DISCORD_OAUTH_ENABLED:-false}
-      KOFAUTH_DISCORD_OAUTH_CLIENT_ID: ${DISCORD_OAUTH_CLIENT_ID:-}
-      KOFAUTH_DISCORD_OAUTH_CLIENT_SECRET: ${DISCORD_OAUTH_CLIENT_SECRET:-}
-      KOFAUTH_DISCORD_OAUTH_REDIRECT_URI: ${DISCORD_OAUTH_REDIRECT_URI:-}
-      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=70 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -Duser.timezone=UTC
-    command: ["java", "-jar", "/app/app.jar", "/app/config"]
-    volumes:
-      - ./artifacts/kofauth-discord.jar:/app/app.jar:ro
-      - ./data/config:/app/config
+      KOFAUTH_DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+    command: ["python", "-m", "discord_bot"]
 
   # =========================================================== HTTPS
 

@@ -193,6 +193,9 @@ fill_secret REDIS_PASSWORD      "$(random_alnum 32)"
 fill_secret RCON_PASSWORD       "$(random_alnum 24)"
 fill_secret ENCRYPTION_KEY      "$(random_base64 32)"
 fill_secret JWT_SECRET          "$(random_hex 32)"
+# Ключ доступа ботов к /api/bot. Пустое значение выключает эту поверхность
+# целиком, поэтому он генерируется всегда, даже если боты пока не нужны.
+fill_secret BOT_API_KEY          "$(random_hex 32)"
 fill_secret FORWARDING_SECRET   "$(random_hex 24)"
 [ "$generated" -gt 0 ] && ok "Сгенерировано секретов: $generated" || ok "Секреты на месте"
 

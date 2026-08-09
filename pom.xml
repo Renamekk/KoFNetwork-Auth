@@ -26,8 +26,6 @@
         <module>KoFAuth-Velocity</module>
         <module>KoFAuth-Paper</module>
         <module>KoFAuth-WebAPI</module>
-        <module>KoFAuth-Telegram</module>
-        <module>KoFAuth-Discord</module>
     </modules>
 
     <properties>

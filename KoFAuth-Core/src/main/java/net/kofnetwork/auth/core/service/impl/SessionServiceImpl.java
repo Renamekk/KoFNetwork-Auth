@@ -59,6 +59,9 @@ public final class SessionServiceImpl implements SessionService {
      */
     private static final Duration DB_TOUCH_INTERVAL = Duration.ofMinutes(1);
 
+    /** С какого размера карта продлений начинает чиститься. */
+    private static final int TOUCH_HISTORY_PRUNE_THRESHOLD = 1024;
+
     private final SessionRepository sessions;
     private final DeviceRepository devices;
     private final CacheProvider cache;
@@ -135,6 +138,21 @@ public final class SessionServiceImpl implements SessionService {
     }
 
     @Override
+    public @NotNull CompletableFuture<Optional<String>> currentPublicId(@NotNull UUID playerUuid) {
+        return cache.get(CacheProvider.Keys.SESSION + playerUuid);
+    }
+
+    @Override
+    public @NotNull CompletableFuture<Boolean> hasValidSession(@NotNull UUID playerUuid) {
+        return currentPublicId(playerUuid).thenCompose(publicId -> publicId
+                .map(id -> sessions.findByPublicId(id)
+                        .thenApply(found -> found
+                                .filter(session -> session.isValid(Instant.now()))
+                                .isPresent()))
+                .orElseGet(() -> CompletableFuture.completedFuture(false)));
+    }
+
+    @Override
     public @NotNull CompletableFuture<Optional<Session>> validateByPublicId(@NotNull String publicId,
                                                                             @NotNull IpAddress currentIp) {
         return sessions.findByPublicId(publicId).thenCompose(found -> {
@@ -191,11 +209,47 @@ public final class SessionServiceImpl implements SessionService {
             return cacheUpdate;
         }
         lastDbTouch.put(publicId, now);
+        pruneTouchHistory(now);
 
         return cacheUpdate.thenCompose(ignored ->
                 sessions.findByPublicId(publicId).thenCompose(found -> found
                         .map(session -> sessions.touch(session.id(), now, now.plus(ttl)))
                         .orElseGet(() -> CompletableFuture.completedFuture(null))));
+    }
+
+    /**
+     * Убирает из карты записи о сессиях, которые давно не продлевались.
+     *
+     * <p>Карта существует ради ограничения частоты записи в MySQL и хранит по
+     * записи на сессию. Явно записи удаляются только при отзыве — а сессия,
+     * закончившаяся по сроку, отзыва не проходит, и её запись оставалась
+     * навсегда. На сети с большим оборотом игроков это неограниченный рост
+     * в памяти каждого процесса.
+     *
+     * <p>Порог нужен, чтобы не обходить карту на каждом продлении: при обычном
+     * онлайне она меньше порога, и обход не выполняется вовсе.
+     */
+    private void pruneTouchHistory(Instant now) {
+        if (lastDbTouch.size() < TOUCH_HISTORY_PRUNE_THRESHOLD) {
+            return;
+        }
+        Instant cutoff = now.minus(DB_TOUCH_INTERVAL.multipliedBy(10));
+        lastDbTouch.values().removeIf(at -> at.isBefore(cutoff));
+    }
+
+    @Override
+    public @NotNull CompletableFuture<Void> touchPlayer(@NotNull UUID playerUuid,
+                                                        @NotNull AuthContext context) {
+        return currentPublicId(playerUuid).thenCompose(publicId -> {
+            if (publicId.isEmpty()) {
+                return CompletableFuture.completedFuture(null);
+            }
+            // Привязка перезаписывается тем же значением ради нового срока жизни:
+            // без этого она истекает раньше продлённой сессии, и сессию перестаёт
+            // быть видно по UUID.
+            return cache.set(CacheProvider.Keys.SESSION + playerUuid, publicId.get(), slidingTtl())
+                    .thenCompose(ignored -> touch(publicId.get(), context));
+        });
     }
 
     @Override
@@ -303,10 +357,55 @@ public final class SessionServiceImpl implements SessionService {
                         playerUuid, current, state);
                 return CompletableFuture.completedFuture(false);
             }
-            return cache.set(CacheProvider.Keys.AUTH_STATE + playerUuid, state.name(),
-                            Duration.ofMinutes(5))
-                    .thenApply(ignored -> true);
+            return writeState(playerUuid, state).thenApply(ignored -> true);
         });
+    }
+
+    @Override
+    public @NotNull CompletableFuture<Void> resetState(@NotNull UUID playerUuid,
+                                                        @NotNull AuthState state) {
+        return writeState(playerUuid, state);
+    }
+
+    private CompletableFuture<Void> writeState(UUID playerUuid, AuthState state) {
+        return cache.set(CacheProvider.Keys.AUTH_STATE + playerUuid, state.name(),
+                stateTtl(state));
+    }
+
+    /**
+     * Срок жизни записи о состоянии.
+     *
+     * <p>Раньше он был общим для всех состояний и равнялся пяти минутам. Для
+     * {@link AuthState#AUTHENTICATED} это означало, что через пять минут игры
+     * запись молча исчезала, {@link #getState(UUID)} начинал отвечать
+     * {@link AuthState#CONNECTING}, и вошедший игрок становился неотличим от
+     * только что подключившегося: чат и команды блокировались, а первое же
+     * переключение сервера уводило его обратно в Limbo.
+     *
+     * <p>Поэтому срок привязан к смыслу состояния:
+     * <ul>
+     *   <li>{@code AUTHENTICATED} живёт столько же, сколько сессия, — именно
+     *       сессия и решает, когда вход перестаёт действовать;</li>
+     *   <li>ожидание ввода живёт вдвое дольше таймаута входа: запись обязана
+     *       пережить того, кто медленно набирает пароль, но не обязана
+     *       переживать само соединение;</li>
+     *   <li>{@code BLOCKED} нужен ровно до того момента, как кик дойдёт до
+     *       клиента, и не должен мешать следующей попытке входа.</li>
+     * </ul>
+     */
+    private Duration stateTtl(AuthState state) {
+        return switch (state) {
+            case AUTHENTICATED -> slidingTtl();
+            case BLOCKED -> Duration.ofMinutes(1);
+            default -> {
+                Duration timeout = config.getDuration(ConfigFile.CONFIG,
+                        "auth.login.timeout", Duration.ofSeconds(60));
+                Duration doubled = timeout.multipliedBy(2);
+                yield doubled.compareTo(Duration.ofMinutes(5)) < 0
+                        ? Duration.ofMinutes(5)
+                        : doubled;
+            }
+        };
     }
 
     /**

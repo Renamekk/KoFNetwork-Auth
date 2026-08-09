@@ -13,6 +13,7 @@ import net.kofnetwork.auth.paper.listener.LimboProtectionListener;
 import net.kofnetwork.auth.paper.world.LimboWorldFactory;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.minimessage.MiniMessage;
+import net.kyori.adventure.title.Title;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.World;
@@ -27,6 +28,7 @@ import org.jetbrains.annotations.NotNull;
 
 import java.time.Duration;
 import java.util.Locale;
+import java.util.UUID;
 
 /**
  * Плагин Paper. Работает в одном из двух режимов, задаваемых {@code paper.yml}.
@@ -131,6 +133,90 @@ public final class KoFAuthPaper extends JavaPlugin implements Listener {
         }
 
         startReminder();
+        startLimboTitle();
+    }
+
+    /**
+     * Держит на экране название сети, пока игрок не прошёл вход.
+     *
+     * <p><b>Почему это повторяющаяся задача, а не одна отправка.</b> Титул в
+     * Minecraft живёт заданное число тиков и гаснет сам; протокол не умеет
+     * «показывать, пока не сниму». Поэтому он переотправляется с периодом,
+     * заведомо меньшим времени показа, — тогда следующая отправка приходит до
+     * того, как погасла предыдущая, и надпись выглядит неподвижной. Плавное
+     * появление задаётся только первой отправке: повтор с ненулевым fade-in
+     * заставлял бы надпись пульсировать.
+     *
+     * <p>Подзаголовок зависит от шага входа: пока не пройдена CAPTCHA — про неё,
+     * дальше — про пароль или регистрацию. Игрок всегда видит, чего от него
+     * ждут, даже если пропустил сообщение в чате.
+     */
+    private void startLimboTitle() {
+        if (!core.config().getBoolean(ConfigFile.PAPER, "limbo.title.enabled", true)) {
+            return;
+        }
+        Duration refresh = core.config().getDuration(ConfigFile.PAPER,
+                "limbo.title.refresh", Duration.ofSeconds(2));
+        long ticks = Math.max(20L, refresh.toMillis() / 50L);
+
+        getServer().getScheduler().runTaskTimer(this, () -> {
+            for (Player player : getServer().getOnlinePlayers()) {
+                UUID uuid = player.getUniqueId();
+                core.sessions().getState(uuid).thenAccept(state -> {
+                    if (state.isAuthenticated()) {
+                        titled.remove(uuid);
+                        return;
+                    }
+                    showLimboTitle(player, state);
+                });
+            }
+        }, 20L, ticks);
+    }
+
+    /** Кому титул уже показывался: определяет, нужно ли плавное появление. */
+    private final java.util.Set<UUID> titled = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private void showLimboTitle(Player player, AuthState state) {
+        UUID uuid = player.getUniqueId();
+        boolean first = titled.add(uuid);
+
+        Component header = parse("limbo-title",
+                "<gradient:#4facfe:#00f2fe><bold>KoF Network</bold></gradient>");
+        Component subtitle = parse("limbo-subtitle-" + subtitleKey(player, state),
+                defaultSubtitle(state));
+
+        Title.Times times = Title.Times.times(
+                first ? duration("limbo.title.fade-in", Duration.ofMillis(250)) : Duration.ZERO,
+                duration("limbo.title.stay", Duration.ofSeconds(5)),
+                duration("limbo.title.fade-out", Duration.ofMillis(250)));
+
+        // Adventure в Paper потокобезопасен, отправка из асинхронного колбэка
+        // не требует возврата в главный поток.
+        player.showTitle(Title.title(header, subtitle, times));
+    }
+
+    /**
+     * Какой подзаголовок показать.
+     *
+     * <p>Открытая задача CAPTCHA важнее состояния из Redis: окно уже на экране,
+     * и предлагать в этот момент ввести пароль значит противоречить самому себе.
+     */
+    private String subtitleKey(Player player, AuthState state) {
+        if (state == AuthState.CAPTCHA_REQUIRED
+                || (captchaGui != null && captchaGui.hasActive(player.getUniqueId()))) {
+            return "captcha";
+        }
+        return state == AuthState.AWAITING_REGISTER ? "register" : "login";
+    }
+
+    private static String defaultSubtitle(AuthState state) {
+        return state == AuthState.AWAITING_REGISTER
+                ? "<yellow>Зарегистрируйтесь: <white>/register <пароль> <пароль>"
+                : "<yellow>Войдите: <white>/login <пароль>";
+    }
+
+    private Duration duration(String path, Duration fallback) {
+        return core.config().getDuration(ConfigFile.PAPER, path, fallback);
     }
 
     /**
@@ -175,27 +261,49 @@ public final class KoFAuthPaper extends JavaPlugin implements Listener {
         }, ticks, ticks);
     }
 
+    /** Текст из {@code messages.yml}. */
     private Component parse(String path, String fallback) {
         return miniMessage.deserialize(
-                core.config().getString(ConfigFile.CONFIG, "messages." + path, fallback));
+                core.config().getString(ConfigFile.MESSAGES, path, fallback));
     }
 
     // ------------------------------------------------------------------ события
 
+    /**
+     * Определение состояния игрока при входе на сервер.
+     *
+     * <p><b>Проверка без побочных эффектов.</b> Используется
+     * {@code hasValidSession}, а не {@code validate}. Второй сверяет адрес игрока
+     * с адресом сессии и при несовпадении считает это угоном: отзывает сессию и
+     * публикует событие. На Paper это ломается о факт, что
+     * {@link Player#getAddress()} на раннем этапе входа может вернуть
+     * {@code null} — тогда адрес превращался в {@code 0.0.0.0}, совпадения не
+     * было, и проверка доступа сама уничтожала действующую сессию: игрок
+     * отключался, а вернуться мог только через повторный ввод пароля. Сверку
+     * адреса выполняет прокси, где адрес известен всегда.
+     */
     @EventHandler(priority = EventPriority.LOWEST)
     public void onJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
-        IpAddress ip = IpAddress.ofNullable(
-                player.getAddress() == null ? null : player.getAddress().getAddress().getHostAddress());
 
-        core.sessions().validate(player.getUniqueId(), ip).thenAccept(session -> {
-            boolean authenticated = session.isPresent();
-
+        core.sessions().hasValidSession(player.getUniqueId()).thenAccept(authenticated -> {
             if (mode == Mode.BACKEND) {
                 handleBackendJoin(player, authenticated);
                 return;
             }
             handleLimboJoin(player, authenticated);
+        }).exceptionally(e -> {
+            // Проверка не удалась. На Limbo это безопасно: игрок останется под
+            // защитой. На бэкенде — отключаем, иначе отказ Redis открывал бы
+            // игровой сервер для прямых подключений в обход прокси.
+            getLogger().warning("Не удалось проверить сессию игрока "
+                    + player.getName() + ": " + e);
+            if (mode == Mode.BACKEND) {
+                handleBackendJoin(player, false);
+            } else {
+                handleLimboJoin(player, false);
+            }
+            return null;
         });
     }
 
@@ -212,8 +320,8 @@ public final class KoFAuthPaper extends JavaPlugin implements Listener {
             return;
         }
         getServer().getScheduler().runTask(this, () -> player.kick(
-                miniMessage.deserialize(core.config().getString(ConfigFile.VELOCITY,
-                        "kick-messages.not-authenticated",
+                miniMessage.deserialize(core.config().getString(ConfigFile.MESSAGES,
+                        "kick.not-authenticated",
                         "<red>Вы не прошли аутентификацию."))));
     }
 
@@ -302,12 +410,16 @@ public final class KoFAuthPaper extends JavaPlugin implements Listener {
 
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
+        UUID uuid = event.getPlayer().getUniqueId();
         if (protection != null) {
-            protection.forget(event.getPlayer().getUniqueId());
+            protection.forget(uuid);
         }
         if (captchaGui != null) {
-            captchaGui.forget(event.getPlayer().getUniqueId());
+            captchaGui.forget(uuid);
         }
+        // Иначе множество растёт на каждого зашедшего и никогда не уменьшается,
+        // а вернувшийся игрок не увидит плавного появления надписи.
+        titled.remove(uuid);
     }
 
     @Override

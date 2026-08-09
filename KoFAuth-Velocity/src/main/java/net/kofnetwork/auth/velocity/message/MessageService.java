@@ -28,13 +28,12 @@ public final class MessageService {
         this.config = config;
     }
 
-    /** Сообщение по пути в {@code config.yml} с префиксом сети. */
+    /** Сообщение по пути в {@code messages.yml} с префиксом сети. */
     public @NotNull Component prefixed(@NotNull String path, @NotNull String fallback) {
-        String prefix = config.getString(ConfigFile.CONFIG, "messages.prefix", "");
-        return miniMessage.deserialize(prefix + raw(path, fallback));
+        return miniMessage.deserialize(prefix() + raw(path, fallback));
     }
 
-    /** Сообщение без префикса — для заголовков и кик-сообщений. */
+    /** Сообщение без префикса — для заголовков и надписей на экране. */
     public @NotNull Component plain(@NotNull String path, @NotNull String fallback) {
         return miniMessage.deserialize(raw(path, fallback));
     }
@@ -43,14 +42,16 @@ public final class MessageService {
     public @NotNull Component prefixed(@NotNull String path,
                                        @NotNull String fallback,
                                        @NotNull Map<String, String> placeholders) {
-        String prefix = config.getString(ConfigFile.CONFIG, "messages.prefix", "");
-        return miniMessage.deserialize(substitute(prefix + raw(path, fallback), placeholders));
+        return miniMessage.deserialize(substitute(prefix() + raw(path, fallback), placeholders));
     }
 
-    /** Кик-сообщение из {@code velocity.yml}. */
+    /**
+     * Кик-сообщение.
+     *
+     * <p>Без префикса: экран отключения и так занят только этим текстом.
+     */
     public @NotNull Component kick(@NotNull String path, @NotNull String fallback) {
-        return miniMessage.deserialize(
-                config.getString(ConfigFile.VELOCITY, "kick-messages." + path, fallback));
+        return miniMessage.deserialize(raw("kick." + path, fallback));
     }
 
     /** Произвольная строка MiniMessage. */
@@ -58,8 +59,24 @@ public final class MessageService {
         return miniMessage.deserialize(value);
     }
 
+    /**
+     * Готовая строка с префиксом — для сообщений, собираемых на месте.
+     *
+     * <p>Нужна командам, которые строят текст из данных (список сессий,
+     * состояние системы): выносить каждую такую строку в файл бессмысленно,
+     * а префикс у них должен быть общий.
+     */
+    public @NotNull Component prefixedRaw(@NotNull String text) {
+        return miniMessage.deserialize(prefix() + text);
+    }
+
+    /** Префикс сети. */
+    public @NotNull String prefix() {
+        return config.getString(ConfigFile.MESSAGES, "prefix", "");
+    }
+
     private String raw(String path, String fallback) {
-        return config.getString(ConfigFile.CONFIG, "messages." + path, fallback);
+        return config.getString(ConfigFile.MESSAGES, path, fallback);
     }
 
     /**

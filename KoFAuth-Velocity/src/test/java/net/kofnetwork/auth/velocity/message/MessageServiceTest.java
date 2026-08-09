@@ -124,7 +124,7 @@ class MessageServiceTest {
 
     @Test
     void значение_из_конфигурации_перекрывает_запасное() {
-        config.put(ConfigFile.CONFIG, "messages.wrong-password", "<red>Неверный пароль");
+        config.put(ConfigFile.MESSAGES, "wrong-password", "<red>Неверный пароль");
 
         assertThat(plain(messages.plain("wrong-password", "запасной")))
                 .isEqualTo("Неверный пароль");
@@ -132,7 +132,7 @@ class MessageServiceTest {
 
     @Test
     void префикс_добавляется_в_начало() {
-        config.put(ConfigFile.CONFIG, "messages.prefix", "<gray>[KoF] ");
+        config.put(ConfigFile.MESSAGES, "prefix", "<gray>[KoF] ");
 
         assertThat(plain(messages.prefixed("hello", "Привет")))
                 .isEqualTo("[KoF] Привет");
@@ -140,7 +140,7 @@ class MessageServiceTest {
 
     @Test
     void подстановки_заменяются() {
-        config.put(ConfigFile.CONFIG, "messages.attempts",
+        config.put(ConfigFile.MESSAGES, "attempts",
                 "Осталось попыток: <attempts>");
 
         assertThat(plain(messages.prefixed("attempts", "", Map.of("attempts", "3"))))
@@ -151,37 +151,58 @@ class MessageServiceTest {
     void неизвестная_подстановка_остаётся_как_есть_и_не_ломает_разбор() {
         // MiniMessage игнорирует неизвестные теги, а не бросает исключение:
         // опечатка в конфигурации не должна выключать сообщение целиком.
-        config.put(ConfigFile.CONFIG, "messages.oops", "Значение: <нет-такого>");
+        config.put(ConfigFile.MESSAGES, "oops", "Значение: <нет-такого>");
 
         assertThat(plain(messages.prefixed("oops", "", Map.of("attempts", "3"))))
                 .contains("Значение:");
     }
 
     @Test
-    void кик_сообщения_берутся_из_velocity_yml() {
-        // Отдельный файл: кик-тексты правит тот, кто настраивает прокси,
-        // и путать их с общими сообщениями сети не следует.
-        config.put(ConfigFile.VELOCITY, "kick-messages.account-locked", "<red>Заблокирован");
+    void кик_сообщения_живут_в_секции_kick() {
+        // Все обращённые к игроку строки собраны в одном файле: искать текст,
+        // который он видит, в двух местах — верный способ забыть про одно из них.
+        config.put(ConfigFile.MESSAGES, "kick.account-locked", "<red>Заблокирован");
 
         assertThat(plain(messages.kick("account-locked", "запасной")))
                 .isEqualTo("Заблокирован");
     }
 
     @Test
+    void кик_идёт_без_префикса() {
+        // Экран отключения занят только этим текстом, и префикс сети на нём
+        // лишь отнимает место.
+        config.put(ConfigFile.MESSAGES, "prefix", "<gray>[KoF] ");
+        config.put(ConfigFile.MESSAGES, "kick.timeout", "Не успели войти");
+
+        assertThat(plain(messages.kick("timeout", "запасной")))
+                .isEqualTo("Не успели войти");
+    }
+
+    @Test
+    void собранная_на_месте_строка_получает_префикс() {
+        // Списки сессий и состояние системы строятся из данных: выносить каждую
+        // такую строку в файл незачем, но префикс у них общий с остальными.
+        config.put(ConfigFile.MESSAGES, "prefix", "<gray>[KoF] ");
+
+        assertThat(plain(messages.prefixedRaw("<white>Сессии Steve")))
+                .isEqualTo("[KoF] Сессии Steve");
+    }
+
+    @Test
     void перезагрузка_конфигурации_видна_сразу() {
         // Компоненты не кэшируются намеренно: закэшированный пережил бы
         // /auth reload и оставил на экране старый текст.
-        config.put(ConfigFile.CONFIG, "messages.greeting", "Старое");
+        config.put(ConfigFile.MESSAGES, "greeting", "Старое");
         assertThat(plain(messages.plain("greeting", ""))).isEqualTo("Старое");
 
-        config.put(ConfigFile.CONFIG, "messages.greeting", "Новое");
+        config.put(ConfigFile.MESSAGES, "greeting", "Новое");
         assertThat(plain(messages.plain("greeting", ""))).isEqualTo("Новое");
     }
 
     @Test
     void форматирование_не_попадает_в_текст() {
         // Теги обязаны стать оформлением, а не остаться видимыми символами.
-        config.put(ConfigFile.CONFIG, "messages.styled",
+        config.put(ConfigFile.MESSAGES, "styled",
                 "<gradient:#5b6bff:#3ecf8e><bold>KoF Network</bold></gradient>");
 
         assertThat(plain(messages.plain("styled", "")))

@@ -153,10 +153,14 @@ public final class RegisterCommand implements SimpleCommand {
         };
     }
 
+    /**
+     * Завершение успешной регистрации.
+     *
+     * <p>Привязку UUID к сессии ставит Core внутри {@code register()}; здесь
+     * остаётся только перевести состояние и отправить игрока в лобби.
+     */
     private void onSuccess(Player player, RegistrationResult result) {
-        core.sessions().setState(player.getUniqueId(), AuthState.AUTHENTICATED)
-                .thenCompose(ignored -> core.sessions()
-                        .cacheForPlayer(player.getUniqueId(), result.session()))
+        core.sessions().resetState(player.getUniqueId(), AuthState.AUTHENTICATED)
                 .thenRun(() -> {
                     player.sendMessage(messages.prefixed("register-success",
                             "<green>Аккаунт создан. Не забудьте привязать почту."));
@@ -169,6 +173,13 @@ public final class RegisterCommand implements SimpleCommand {
                 });
     }
 
+    /**
+     * Автодополнение отключено намеренно.
+     *
+     * <p>Оба аргумента — пароль. Любой возвращённый вариант клиент показал бы
+     * на экране и подставил бы в строку ввода по нажатию TAB, то есть
+     * автодополнение здесь может только навредить.
+     */
     @Override
     public List<String> suggest(Invocation invocation) {
         return List.of();

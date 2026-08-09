@@ -9,6 +9,7 @@ import org.jetbrains.annotations.Nullable;
 
 import java.time.Duration;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -57,6 +58,74 @@ public interface LinkService {
     @NotNull CompletableFuture<OperationResult<DiscordBinding>> completeDiscordLink(@NotNull String code,
                                                                                     long discordId,
                                                                                     @NotNull AuthContext context);
+
+    // ------------------------------------------------------------------ привязка сайта
+
+    /**
+     * Начинает привязку игрового аккаунта к сессии браузера.
+     *
+     * <p><b>Направление то же, что и у мессенджеров, и по той же причине.</b> Сайт
+     * не может доказать владение игровым аккаунтом — доказать его можно только
+     * в игре. Поэтому сайт лишь показывает код, а подтверждает его игрок командой
+     * {@code /link <код>}, находясь в аккаунте. Обратный порядок («введите ник на
+     * сайте, подтвердите в игре») позволил бы начать привязку к любому чужому нику
+     * и завалить владельца запросами.
+     *
+     * <p>Схема повторяет device authorization grant: у сайта есть код для человека
+     * и отдельный секрет для опроса. Это разные значения намеренно — код короткий,
+     * его видно на экране и диктуют вслух, а {@code pollToken} предъявляет право
+     * получить токены доступа и не должен быть угадываемым.
+     *
+     * @return код для игрока и секрет для опроса состояния
+     */
+    @NotNull CompletableFuture<OperationResult<WebLinkRequest>> startWebLink(@NotNull AuthContext context);
+
+    /**
+     * Запрос сайта на привязку.
+     *
+     * @param code      короткий код, который игрок вводит в игре
+     * @param pollToken секрет браузера для опроса состояния
+     * @param ttl       срок жизни запроса
+     */
+    record WebLinkRequest(@NotNull String code, @NotNull String pollToken, @NotNull Duration ttl) {
+    }
+
+    /**
+     * Подтверждает запрос сайта из игры.
+     *
+     * <p>Вызывается командой {@code /link} только для вошедшего игрока: привязка
+     * означает выдачу браузеру полного доступа к аккаунту, и подтверждать её
+     * вправе лишь тот, кто уже доказал владение паролем.
+     *
+     * @param playerUuid UUID подтвердившего; именно он, а не ник, попадает в
+     *                   привязку — ник можно сменить, UUID останется прежним
+     */
+    @NotNull CompletableFuture<OperationResult<Void>> confirmWebLink(@NotNull String code,
+                                                                      @NotNull UUID playerUuid,
+                                                                      long accountId,
+                                                                      @NotNull AuthContext context);
+
+    /**
+     * Опрашивает состояние запроса.
+     *
+     * <p>Подтверждение выдаётся <em>один раз</em>: второй опрос по тому же
+     * {@code pollToken} вернёт пустое значение. Иначе секрет, попавший в историю
+     * браузера или в лог обратного прокси, оставался бы годным ключом к аккаунту
+     * до истечения срока.
+     *
+     * @return пустое значение, пока игрок не подтвердил либо если запрос истёк
+     */
+    @NotNull CompletableFuture<Optional<WebLinkConfirmation>> pollWebLink(@NotNull String pollToken);
+
+    /**
+     * Подтверждённая привязка.
+     *
+     * @param playerUuid UUID игрока — ключ привязки
+     */
+    record WebLinkConfirmation(long accountId,
+                               @NotNull UUID playerUuid,
+                               @NotNull String username) {
+    }
 
     /**
      * Завершает привязку Discord, личность в котором уже подтверждена OAuth2.

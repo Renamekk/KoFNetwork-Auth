@@ -203,7 +203,7 @@ public final class CaptchaGuiManager implements Listener {
         UUID uuid = player.getUniqueId();
         active.remove(uuid);
         player.closeInventory();
-        player.sendMessage(prefixed("Проверка пройдена."));
+        player.sendMessage(message("captcha-passed", "<green>Проверка пройдена."));
         playSound(player, core.config().getString(ConfigFile.PAPER, "gui.success-sound", ""));
         passThrough(player);
     }
@@ -232,13 +232,14 @@ public final class CaptchaGuiManager implements Listener {
 
         String action = core.config().getString(ConfigFile.CAPTCHA, "on-failure", "kick");
         if ("new-challenge".equalsIgnoreCase(action)) {
-            player.sendMessage(prefixed("Попытки исчерпаны. Выдана новая проверка."));
+            player.sendMessage(message("captcha-exhausted",
+                    "<yellow>Попытки исчерпаны. Выдана новая проверка."));
             issueAfterFailure(player);
             return;
         }
         core.sessions().setState(player.getUniqueId(), AuthState.BLOCKED);
-        player.kick(miniMessage.deserialize(core.config().getString(ConfigFile.VELOCITY,
-                "kick-messages.captcha-failed",
+        player.kick(miniMessage.deserialize(core.config().getString(ConfigFile.MESSAGES,
+                "kick.captcha-failed",
                 "<red>Проверка не пройдена.")));
     }
 
@@ -293,8 +294,23 @@ public final class CaptchaGuiManager implements Listener {
     }
 
     private Component prefixed(String text) {
-        String prefix = core.config().getString(ConfigFile.CONFIG, "messages.prefix", "");
+        String prefix = core.config().getString(ConfigFile.MESSAGES, "prefix", "");
         return miniMessage.deserialize(prefix + "<yellow>" + text);
+    }
+
+    /** Текст с единственной подстановкой {@code <attempts>}. */
+    private Component messages(String path, String fallback, String attempts) {
+        String prefix = core.config().getString(ConfigFile.MESSAGES, "prefix", "");
+        return miniMessage.deserialize(
+                (prefix + core.config().getString(ConfigFile.MESSAGES, path, fallback))
+                        .replace("<attempts>", attempts));
+    }
+
+    /** Текст из {@code messages.yml} с префиксом сети. */
+    private Component message(String path, String fallback) {
+        String prefix = core.config().getString(ConfigFile.MESSAGES, "prefix", "");
+        return miniMessage.deserialize(
+                prefix + core.config().getString(ConfigFile.MESSAGES, path, fallback));
     }
 
     private void playSound(Player player, String sound) {

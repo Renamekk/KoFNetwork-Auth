@@ -145,6 +145,12 @@ public interface CacheProvider extends AutoCloseable {
         public static final String IP_REPUTATION = "ipreputation:";
         public static final String NONCE = "nonce:";
 
+        /** Код привязки сайта: короткий, вводится игроком. */
+        public static final String WEB_LINK_CODE = "weblink:code:";
+
+        /** Секрет браузера для опроса состояния привязки. */
+        public static final String WEB_LINK_POLL = "weblink:poll:";
+
         /** Канал доменных событий между процессами. */
         public static final String CHANNEL_EVENTS = "events";
 

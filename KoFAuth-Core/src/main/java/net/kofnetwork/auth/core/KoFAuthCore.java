@@ -175,7 +175,7 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
                 mailTemplates, config, executors, eventBus);
 
         this.links = new LinkServiceImpl(telegramRepo, discordRepo, accountRepo, tokens,
-                audit, eventBus);
+                audit, eventBus, cache, config, security);
 
         this.registration = new RegistrationServiceImpl(accountRepo, roleRepo, settingsRepo,
                 sessions, security, audit, hasher, policy, config, eventBus);

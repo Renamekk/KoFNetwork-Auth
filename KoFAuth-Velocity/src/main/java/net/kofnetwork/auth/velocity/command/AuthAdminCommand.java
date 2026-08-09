@@ -3,6 +3,7 @@ package net.kofnetwork.auth.velocity.command;
 import com.velocitypowered.api.command.CommandSource;
 import com.velocitypowered.api.command.SimpleCommand;
 import com.velocitypowered.api.proxy.Player;
+import com.velocitypowered.api.proxy.ProxyServer;
 import net.kofnetwork.auth.api.dto.AuthContext;
 import net.kofnetwork.auth.api.model.Account;
 import net.kofnetwork.auth.api.model.AccountStatus;
@@ -15,6 +16,7 @@ import net.kofnetwork.auth.velocity.message.MessageService;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 
 import java.nio.file.Path;
@@ -44,21 +46,152 @@ public final class AuthAdminCommand implements SimpleCommand {
             .ofPattern("dd.MM.yyyy HH:mm:ss")
             .withZone(ZoneOffset.UTC);
 
-    private static final List<String> SUBCOMMANDS = List.of(
-            "reload", "info", "player", "lock", "unlock", "resetpassword",
-            "forceverify", "sessions", "devices", "logs", "migrate", "export", "import");
+    /**
+     * Описание подкоманды: то же самое питает и справку, и автодополнение.
+     *
+     * <p>Один источник вместо двух списков — иначе добавленная подкоманда
+     * неизбежно оказывается либо без подсказки, либо без описания в справке.
+     *
+     * @param name        имя подкоманды
+     * @param syntax      аргументы в том виде, в каком их набирает администратор
+     * @param summary     одна строка для общего списка
+     * @param details     развёрнутое объяснение: что именно делает и чем чревато
+     * @param examples    примеры вызова
+     * @param takesPlayer нужен ли вторым аргументом ник — по нему строится
+     *                    автодополнение
+     */
+    private record SubCommand(String name,
+                              String syntax,
+                              String summary,
+                              List<String> details,
+                              List<String> examples,
+                              boolean takesPlayer) {
+
+        String permission() {
+            return "kofauth.admin." + permissionFor(name);
+        }
+    }
+
+    private static final List<SubCommand> SUBCOMMANDS = List.of(
+            new SubCommand("help", "[подкоманда]",
+                    "справка по командам",
+                    List.of("Без аргумента — список всех подкоманд.",
+                            "С аргументом — подробное описание одной."),
+                    List.of("/auth help", "/auth help resetpassword"), false),
+
+            new SubCommand("reload", "",
+                    "перечитать конфигурацию",
+                    List.of("Перечитывает все YAML-файлы без перезапуска сети.",
+                            "Соединения с базой и Redis не пересоздаются, игроки не отключаются.",
+                            "Изменения размеров пулов и параметров подключения к базе",
+                            "требуют полного перезапуска — они применяются только при старте."),
+                    List.of("/auth reload"), false),
+
+            new SubCommand("info", "",
+                    "состояние системы",
+                    List.of("Готовность, состояние пула базы, кэша и рабочих пулов.",
+                            "Первое, что стоит посмотреть при жалобах на медленный вход."),
+                    List.of("/auth info"), false),
+
+            new SubCommand("player", "<ник>",
+                    "сведения об аккаунте",
+                    List.of("Статус, дата регистрации, последний вход и адрес,",
+                            "геолокация, число неудачных попыток, второй фактор, CAPTCHA.",
+                            "Адреса показываются частично скрытыми."),
+                    List.of("/auth player Steve"), true),
+
+            new SubCommand("lock", "<ник>",
+                    "заблокировать аккаунт",
+                    List.of("Вход закрывается, все сессии разрываются немедленно.",
+                            "Игрок остаётся в базе; данные не удаляются.",
+                            "Снимается командой /auth unlock."),
+                    List.of("/auth lock Steve"), true),
+
+            new SubCommand("unlock", "<ник>",
+                    "разблокировать аккаунт",
+                    List.of("Возвращает статус ACTIVE и снимает ограничение частоты",
+                            "попыток входа по этому нику — иначе игрок упрётся в лимит,",
+                            "накопленный до блокировки."),
+                    List.of("/auth unlock Steve"), true),
+
+            new SubCommand("resetpassword", "<ник> <новый пароль>",
+                    "сменить пароль игроку",
+                    List.of("Пароль проверяется политикой сложности, как при регистрации.",
+                            "Все сессии аккаунта разрываются, refresh-токены отзываются.",
+                            "Игрок получает уведомление на почту, если она подтверждена.",
+                            "<red>Пароль виден в истории команд — выдавайте временный",
+                            "<red>и требуйте сменить его самостоятельно."),
+                    List.of("/auth resetpassword Steve Vremenny42Parol"), true),
+
+            new SubCommand("forceverify", "<ник>",
+                    "подтвердить почту вручную",
+                    List.of("Помечает привязанную почту подтверждённой без кода.",
+                            "Нужно, когда письмо не доходит, а восстановление пароля",
+                            "игроку требуется. Почта должна быть уже привязана."),
+                    List.of("/auth forceverify Steve"), true),
+
+            new SubCommand("sessions", "<ник>",
+                    "активные сессии игрока",
+                    List.of("Тип, адрес, время последней активности и сервер.",
+                            "Несколько игровых сессий при max-concurrent: 1 —",
+                            "признак того, что аккаунтом пользуются не только владельцем."),
+                    List.of("/auth sessions Steve"), true),
+
+            new SubCommand("devices", "<ник>",
+                    "устройства игрока",
+                    List.of("Список известных устройств с отметками доверия и блокировки.",
+                            "Доверенное устройство не требует второго фактора."),
+                    List.of("/auth devices Steve"), true),
+
+            new SubCommand("logs", "<ник>",
+                    "журнал безопасности игрока",
+                    List.of("Последние 15 событий: входы, отказы, смены пароля и привязок.",
+                            "Полная история — в личном кабинете и в таблице security_logs."),
+                    List.of("/auth logs Steve"), true),
+
+            new SubCommand("migrate", "",
+                    "применить миграции схемы",
+                    List.of("Нужна при migrate-on-startup: false.",
+                            "Момент обновления схемы выбирает администратор, а не гонка",
+                            "нескольких прокси за то, кто первым перезапустится."),
+                    List.of("/auth migrate"), false),
+
+            new SubCommand("export", "<файл>",
+                    "выгрузить аккаунты",
+                    List.of("<red>Файл содержит хэши паролей всей сети.",
+                            "<red>Обращайтесь с ним как с дампом базы.",
+                            "Событие пишется в журнал как критическое."),
+                    List.of("/auth export backup/accounts.json"), false),
+
+            new SubCommand("import", "<файл>",
+                    "загрузить аккаунты из выгрузки",
+                    List.of("Существующие ники пропускаются, а не перезаписываются.",
+                            "В отчёте видно, сколько записей загружено и сколько пропущено."),
+                    List.of("/auth import backup/accounts.json"), false));
+
+    private static final List<String> SUBCOMMAND_NAMES =
+            SUBCOMMANDS.stream().map(SubCommand::name).toList();
 
     private final KoFAuthCore core;
+    private final ProxyServer proxy;
     private final MessageService messages;
     private final Logger logger;
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
 
     public AuthAdminCommand(@NotNull KoFAuthCore core,
+                            @NotNull ProxyServer proxy,
                             @NotNull MessageService messages,
                             @NotNull Logger logger) {
         this.core = core;
+        this.proxy = proxy;
         this.messages = messages;
         this.logger = logger;
+    }
+
+    private static Optional<SubCommand> describe(String name) {
+        return SUBCOMMANDS.stream()
+                .filter(sub -> sub.name().equalsIgnoreCase(name))
+                .findFirst();
     }
 
     @Override
@@ -72,6 +205,14 @@ public final class AuthAdminCommand implements SimpleCommand {
         }
 
         String sub = args[0].toLowerCase(Locale.ROOT);
+
+        // Справка не требует прав: она не раскрывает данных и нужна прежде всего
+        // тому, кто ещё не разобрался, какие права ему выданы.
+        if ("help".equals(sub) || "?".equals(sub) || "справка".equals(sub)) {
+            help(source, args.length > 1 ? args[1] : null);
+            return;
+        }
+
         requirePermission(source, "kofauth.admin." + permissionFor(sub)).thenAccept(allowed -> {
             if (!allowed) {
                 source.sendMessage(miniMessage.deserialize("<red>Недостаточно прав."));
@@ -112,6 +253,9 @@ public final class AuthAdminCommand implements SimpleCommand {
     // ------------------------------------------------------------------ подкоманды
 
     private void reload(CommandSource source) {
+        // Заодно сбрасываем отражение прав: выданная только что роль должна
+        // подхватываться перезагрузкой, а не переподключением игрока.
+        adminCache.clear();
         source.sendMessage(prefixed("<yellow>Перезагрузка конфигурации..."));
         core.config().reload().thenAccept(report -> {
             if (report.success()) {
@@ -407,23 +551,75 @@ public final class AuthAdminCommand implements SimpleCommand {
     }
 
     private void usage(CommandSource source) {
-        source.sendMessage(prefixed("<white>Команды <gray>/auth"));
-        source.sendMessage(miniMessage.deserialize("""
-                  <gray>reload <white>— перезагрузить конфигурацию
-                  <gray>info <white>— состояние системы
-                  <gray>player <ник> <white>— сведения об аккаунте
-                  <gray>lock|unlock <ник> <white>— блокировка аккаунта
-                  <gray>resetpassword <ник> <пароль> <white>— сброс пароля
-                  <gray>forceverify <ник> <white>— подтвердить почту
-                  <gray>sessions|devices|logs <ник> <white>— сессии, устройства, журнал
-                  <gray>migrate <white>— применить миграции схемы
-                  <gray>export <файл> <white>— выгрузить аккаунты (содержит хэши паролей)
-                  <gray>import <файл> <white>— загрузить аккаунты из выгрузки"""));
+        help(source, null);
     }
 
+    /**
+     * Справка по {@code /auth}.
+     *
+     * <p>Без аргумента — обзор: имя, аргументы и одна строка назначения на каждую
+     * подкоманду. С аргументом — всё, что нужно знать перед вызовом: развёрнутое
+     * описание последствий, узел прав и примеры.
+     *
+     * <p>Имя подкоманды кликабельно и подставляется в строку ввода: набирать
+     * {@code /auth help resetpassword} руками ради описания — ровно тот барьер,
+     * из-за которого справку не читают.
+     */
+    private void help(CommandSource source, @Nullable String topic) {
+        if (topic == null || topic.isBlank()) {
+            helpOverview(source);
+            return;
+        }
+        Optional<SubCommand> found = describe(topic);
+        if (found.isEmpty()) {
+            source.sendMessage(prefixed("<red>Подкоманды «" + escape(topic) + "» нет."));
+            source.sendMessage(miniMessage.deserialize(
+                    "  <gray>Список: <white><click:suggest_command:'/auth help'>/auth help</click>"));
+            return;
+        }
+        helpTopic(source, found.get());
+    }
+
+    private void helpOverview(CommandSource source) {
+        source.sendMessage(prefixed("<gray>─── <white>KoFAuth " + core.version()
+                + " <gray>— команды <white>/auth <gray>───"));
+
+        for (SubCommand sub : SUBCOMMANDS) {
+            String syntax = sub.syntax().isEmpty() ? "" : " <dark_gray>" + escape(sub.syntax());
+            source.sendMessage(miniMessage.deserialize(
+                    "  <click:suggest_command:'/auth " + sub.name() + " '>"
+                            + "<hover:show_text:'<gray>Подробно: <white>/auth help " + sub.name() + "'>"
+                            + "<yellow>" + sub.name() + "</hover></click>"
+                            + syntax + " <gray>— " + sub.summary()));
+        }
+
+        source.sendMessage(miniMessage.deserialize(
+                "  <gray>Подробно о любой: <white><click:suggest_command:'/auth help '>"
+                        + "/auth help <подкоманда></click>"));
+        source.sendMessage(miniMessage.deserialize(
+                "  <dark_gray>Права выдаются ролями KoFAuth, а не permissions.json прокси."));
+    }
+
+    private void helpTopic(CommandSource source, SubCommand sub) {
+        source.sendMessage(prefixed("<gray>─── <white>/auth " + sub.name() + " <gray>───"));
+        source.sendMessage(miniMessage.deserialize("  <gray>Назначение: <white>" + sub.summary()));
+        source.sendMessage(miniMessage.deserialize("  <gray>Синтаксис: <white>/auth "
+                + sub.name() + (sub.syntax().isEmpty() ? "" : " " + escape(sub.syntax()))));
+        source.sendMessage(miniMessage.deserialize("  <gray>Право: <white>" + sub.permission()));
+
+        source.sendMessage(miniMessage.deserialize("  <gray>Описание:"));
+        sub.details().forEach(linePart ->
+                source.sendMessage(miniMessage.deserialize("    <white>" + linePart)));
+
+        source.sendMessage(miniMessage.deserialize("  <gray>Примеры:"));
+        sub.examples().forEach(example -> source.sendMessage(miniMessage.deserialize(
+                "    <click:suggest_command:'" + example + "'><aqua>" + escape(example)
+                        + "</click>")));
+    }
+
+    /** Строка, собранная на месте, с общим префиксом сети. */
     private Component prefixed(String text) {
-        return messages.parse(core.config().getString(
-                net.kofnetwork.auth.api.config.ConfigFile.CONFIG, "messages.prefix", "") + text);
+        return messages.prefixedRaw(text);
     }
 
     private void line(CommandSource source, String label, String value) {
@@ -458,21 +654,109 @@ public final class AuthAdminCommand implements SimpleCommand {
         return value == null ? "" : value.replace("<", "\\<");
     }
 
+    /**
+     * Автодополнение.
+     *
+     * <p>Дополняется не только подкоманда, но и её аргументы. Прежняя версия
+     * отвечала лишь на первое слово: на {@code /auth player <TAB>} подсказок не
+     * было, потому что проверка {@code args.length <= 1} не учитывала пустой
+     * элемент, который Velocity добавляет после пробела.
+     *
+     * <p>Пароль и пути к файлам не дополняются: первый секретен, второй ведёт
+     * в файловую систему прокси, содержимое которой игроку знать незачем.
+     */
     @Override
     public List<String> suggest(Invocation invocation) {
         String[] args = invocation.arguments();
-        if (args.length <= 1) {
-            String prefix = args.length == 0 ? "" : args[0].toLowerCase(Locale.ROOT);
-            return SUBCOMMANDS.stream().filter(name -> name.startsWith(prefix)).toList();
+        String partial = Suggestions.partial(args);
+
+        if (Suggestions.depth(args) == 1) {
+            return Suggestions.matching(SUBCOMMAND_NAMES, partial);
         }
+
+        String sub = Suggestions.subcommand(args);
+
+        if (Suggestions.depth(args) == 2) {
+            if ("help".equals(sub)) {
+                return Suggestions.matching(SUBCOMMAND_NAMES, partial);
+            }
+            return describe(sub)
+                    .filter(SubCommand::takesPlayer)
+                    .map(ignored -> Suggestions.onlinePlayers(proxy, partial))
+                    .orElseGet(List::of);
+        }
+
         return List.of();
     }
 
+    /**
+     * Кому RBAC уже подтвердил или отказал в доступе к {@code /auth}.
+     *
+     * <p>Отражение права из базы. Спрашивать базу синхронно нельзя: Velocity
+     * вызывает {@link #hasPermission} в том числе на каждое нажатие TAB.
+     */
+    private final java.util.Map<java.util.UUID, Boolean> adminCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Допускать ли источник к команде.
+     *
+     * <p><b>Почему нельзя полагаться на права Velocity.</b> Прежняя версия
+     * требовала право {@code kofauth.admin} у самого прокси. Но Velocity не имеет
+     * встроенной системы прав: без стороннего плагина
+     * {@link com.velocitypowered.api.permission.PermissionSubject#hasPermission}
+     * отвечает {@code UNDEFINED}, что приводится к {@code false} для любого
+     * игрока. Команда отклонялась прокси ещё до вызова {@link #execute}, поэтому
+     * роль администратора, выданная в базе, не проверялась никогда — сеть без
+     * плагина прав оставалась вообще без работающего {@code /auth}.
+     *
+     * <p>Теперь источником истины служит RBAC, как и заявлено в описании класса.
+     * Право Velocity осталось достаточным условием — на сетях с LuckPerms им
+     * удобно выдавать доступ, не заводя роль в базе.
+     *
+     * <p>Пока ответ RBAC неизвестен, команда пропускается: точная проверка всё
+     * равно выполняется в {@link #execute} и откажет с понятным сообщением.
+     * Пропуск здесь ничего не открывает — он лишь позволяет первому вызову
+     * дойти до настоящей проверки, а не потеряться.
+     */
     @Override
     public boolean hasPermission(Invocation invocation) {
-        // Точная проверка асинхронна и выполняется в execute; здесь только грубая
-        // отсечка, чтобы команда не светилась в подсказках у обычных игроков.
-        return !(invocation.source() instanceof Player)
-                || invocation.source().hasPermission("kofauth.admin");
+        if (!(invocation.source() instanceof Player player)) {
+            // Консоль имеет все права безусловно: у неё нет аккаунта, и заводить
+            // его администратору сервера бессмысленно.
+            return true;
+        }
+        if (player.hasPermission("kofauth.admin")) {
+            return true;
+        }
+
+        Boolean known = adminCache.get(player.getUniqueId());
+        if (known != null) {
+            return known;
+        }
+        refreshAdminCache(player);
+        return true;
+    }
+
+    /** Спрашивает RBAC и запоминает ответ. */
+    private void refreshAdminCache(Player player) {
+        requirePermission(player, "kofauth.admin")
+                .thenAccept(allowed -> adminCache.put(player.getUniqueId(), allowed))
+                .exceptionally(e -> {
+                    logger.warn("Не удалось проверить права игрока {}",
+                            player.getUsername(), e);
+                    return null;
+                });
+    }
+
+    /**
+     * Забывает игрока при отключении.
+     *
+     * <p>Иначе карта растёт на каждого зашедшего, а выданная роль не подхватится
+     * до перезапуска прокси: вернувшийся игрок получит ответ, записанный
+     * в прошлое подключение.
+     */
+    public void forget(@NotNull java.util.UUID playerUuid) {
+        adminCache.remove(playerUuid);
     }
 }

@@ -14,13 +14,13 @@ import net.kofnetwork.auth.api.config.ConfigFile;
 import net.kofnetwork.auth.api.event.events.RemoteEvent;
 import net.kofnetwork.auth.api.event.events.SessionInvalidatedEvent;
 import net.kofnetwork.auth.api.model.AuthState;
-import net.kofnetwork.auth.api.model.IpAddress;
 import net.kofnetwork.auth.core.KoFAuthCore;
 import net.kofnetwork.auth.velocity.command.AuthAdminCommand;
 import net.kofnetwork.auth.velocity.command.EmailCommand;
 import net.kofnetwork.auth.velocity.command.LinkCommand;
 import net.kofnetwork.auth.velocity.command.LoginCommand;
 import net.kofnetwork.auth.velocity.command.RegisterCommand;
+import net.kofnetwork.auth.velocity.command.WebLinkCommand;
 import net.kofnetwork.auth.velocity.limbo.LimboRouter;
 import net.kofnetwork.auth.velocity.listener.AuthenticationListener;
 import net.kofnetwork.auth.velocity.message.MessageService;
@@ -57,6 +57,7 @@ public final class KoFAuthVelocity {
     private KoFAuthCore core;
     private LimboRouter router;
     private MessageService messages;
+    private AuthAdminCommand adminCommand;
 
     @Inject
     public KoFAuthVelocity(ProxyServer proxy, Logger logger, @DataDirectory Path dataDirectory) {
@@ -86,6 +87,7 @@ public final class KoFAuthVelocity {
 
         subscribeToRemoteEvents();
         scheduleLoginTimeout();
+        scheduleSessionKeepAlive();
 
         logger.info("KoFAuth запущен на прокси");
     }
@@ -109,13 +111,22 @@ public final class KoFAuthVelocity {
                 .aliases("kofauth")
                 .plugin(this)
                 .build();
-        commands.register(auth, new AuthAdminCommand(core, messages, logger));
+        this.adminCommand = new AuthAdminCommand(core, proxy, messages, logger);
+        commands.register(auth, adminCommand);
 
         CommandMeta email = commands.metaBuilder("email")
                 .aliases("почта")
                 .plugin(this)
                 .build();
         commands.register(email, new EmailCommand(core, messages, logger));
+
+        // Подтверждение привязки сайта. Направление то же, что у мессенджеров:
+        // код показывает сайт, а решение принимает тот, кто уже вошёл в игре.
+        CommandMeta link = commands.metaBuilder("link")
+                .aliases("привязать")
+                .plugin(this)
+                .build();
+        commands.register(link, new WebLinkCommand(core, messages, logger));
 
         // Код привязки выдаётся в игре и вводится в мессенджере. Обратное
         // направление позволило бы привязать свой Telegram к чужому нику:
@@ -190,7 +201,7 @@ public final class KoFAuthVelocity {
     /**
      * Выкидывает игроков, чья сессия отозвана, обратно в Limbo.
      *
-     * <p>Сопоставление идёт через проверку сессии: держать на прокси карту
+     * <p>Сопоставление идёт через привязку UUID к сессии: держать на прокси карту
      * «accountId → игрок» значило бы дублировать состояние, которое уже есть
      * в Redis, и рассинхронизироваться с ним при каждом переподключении.
      *
@@ -201,6 +212,15 @@ public final class KoFAuthVelocity {
      * с сообщением «Ваша сессия завершена. Войдите заново». Событие при этом
      * честно перечисляло только старые сессии; их просто никто не читал.
      *
+     * <p><b>Читается привязка, а не результат проверки сессии.</b>
+     * {@code validate} для этой задачи не годится по двум причинам. Во-первых, он
+     * возвращает пустое значение и для отозванной, и для просто истёкшей сессии,
+     * и для игрока, который сейчас в Limbo, — а «сессии нет» это не то же самое,
+     * что «названа этим отзывом»; на пустом значении прежний код отключал игрока,
+     * хотя событие его не касалось. Во-вторых, {@code validate} не только читает:
+     * при несовпадении адреса он отзывает сессию и публикует событие — то есть
+     * обход всех игроков сети на каждый отзыв мог порождать новые отзывы.
+     *
      * @param affects принимает публичный идентификатор сессии и отвечает,
      *                затронута ли она отзывом
      */
@@ -210,10 +230,10 @@ public final class KoFAuthVelocity {
                 if (account.isEmpty() || account.get().id() != accountId) {
                     return;
                 }
-                IpAddress ip = IpAddress.of(player.getRemoteAddress().getAddress());
-                core.sessions().validate(player.getUniqueId(), ip).thenAccept(session -> {
-                    if (session.isPresent() && !affects.test(session.get().publicId())) {
-                        // Сессия жива, и отзыв её не называет — игрок остаётся.
+                core.sessions().currentPublicId(player.getUniqueId()).thenAccept(publicId -> {
+                    // Привязки нет — игрок не вошёл и находится в Limbo.
+                    // Отключать его незачем: пароль он всё равно ещё не вводил.
+                    if (publicId.isEmpty() || !affects.test(publicId.get())) {
                         return;
                     }
                     core.sessions().setState(player.getUniqueId(), AuthState.BLOCKED);
@@ -259,6 +279,54 @@ public final class KoFAuthVelocity {
         }).repeat(1, TimeUnit.SECONDS).schedule();
     }
 
+    /**
+     * Продлевает сессии играющих людей.
+     *
+     * <p><b>Без этого скользящий срок не скользил.</b> {@code auth.session.ttl}
+     * описан как срок, продлеваемый активностью, но продлевать его было некому:
+     * {@code touch} не вызывался нигде, кроме тестов. Сессия умирала ровно через
+     * час после входа независимо от того, играл человек всё это время или нет.
+     * Игрок, зашедший «через некоторое время», обнаруживал, что пароль нужно
+     * вводить заново, — и попадал ровно в тот сценарий, где ломались состояние
+     * и маршрутизация.
+     *
+     * <p>Период равен интервалу, с которым {@code touch} вообще доходит до MySQL
+     * (там стоит собственное ограничение частоты записи). Чаще — значит гонять
+     * Redis впустую, реже — значит рисковать тем, что сессия истечёт между
+     * двумя обходами.
+     *
+     * <p>Состояние читается только у игроков вне Limbo: у остальных сессии нет
+     * по определению.
+     */
+    private void scheduleSessionKeepAlive() {
+        proxy.getScheduler().buildTask(this, () -> {
+            for (Player player : proxy.getAllPlayers()) {
+                boolean onLimbo = player.getCurrentServer()
+                        .map(connection -> router.isLimbo(connection.getServerInfo().getName()))
+                        .orElse(true);
+                if (onLimbo) {
+                    continue;
+                }
+                touchSessionOf(player);
+            }
+        }).repeat(1, TimeUnit.MINUTES).schedule();
+    }
+
+    private void touchSessionOf(Player player) {
+        var context = net.kofnetwork.auth.api.dto.AuthContext.minecraft(
+                net.kofnetwork.auth.api.model.IpAddress.of(player.getRemoteAddress().getAddress()),
+                player.getCurrentServer()
+                        .map(connection -> connection.getServerInfo().getName())
+                        .orElse(null),
+                player.getProtocolVersion().getProtocol(),
+                player.getClientBrand());
+
+        core.sessions().touchPlayer(player.getUniqueId(), context).exceptionally(e -> {
+            logger.warn("Не удалось продлить сессию игрока {}", player.getUsername(), e);
+            return null;
+        });
+    }
+
     /** Момент подключения игрока — основа для таймаута входа. */
     private final java.util.Map<java.util.UUID, Long> connectedAt =
             new java.util.concurrent.ConcurrentHashMap<>();
@@ -270,7 +338,11 @@ public final class KoFAuthVelocity {
 
     @Subscribe
     public void onDisconnect(com.velocitypowered.api.event.connection.DisconnectEvent event) {
-        connectedAt.remove(event.getPlayer().getUniqueId());
+        java.util.UUID uuid = event.getPlayer().getUniqueId();
+        connectedAt.remove(uuid);
+        if (adminCommand != null) {
+            adminCommand.forget(uuid);
+        }
     }
 
     @Subscribe

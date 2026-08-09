@@ -276,9 +276,9 @@ public final class LinkCommand implements SimpleCommand {
                 player.getClientBrand());
     }
 
+    /** Строка, собранная на месте, с общим префиксом сети. */
     private Component prefixed(String text) {
-        return messages.parse(core.config().getString(
-                ConfigFile.CONFIG, "messages.prefix", "") + text);
+        return messages.prefixedRaw(text);
     }
 
     /**
@@ -290,16 +290,13 @@ public final class LinkCommand implements SimpleCommand {
     @Override
     public List<String> suggest(Invocation invocation) {
         String[] args = invocation.arguments();
-        if (args.length <= 1) {
-            String prefix = args.length == 0 ? "" : args[0].toLowerCase(Locale.ROOT);
-            return List.of("unlink", "approval").stream()
-                    .filter(name -> name.startsWith(prefix))
-                    .toList();
+        String partial = Suggestions.partial(args);
+
+        if (Suggestions.depth(args) == 1) {
+            return Suggestions.matching(List.of("code", "unlink", "approval"), partial);
         }
-        if (args.length == 2 && "approval".equalsIgnoreCase(args[0])) {
-            return List.of("on", "off").stream()
-                    .filter(name -> name.startsWith(args[1].toLowerCase(Locale.ROOT)))
-                    .toList();
+        if (Suggestions.depth(args) == 2 && "approval".equals(Suggestions.subcommand(args))) {
+            return Suggestions.matching(List.of("on", "off"), partial);
         }
         return List.of();
     }
