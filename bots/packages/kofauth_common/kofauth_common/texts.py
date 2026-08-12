@@ -11,6 +11,52 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+# ------------------------------------------------------------------- бренд
+#
+# В игре бренд собирается градиентом MiniMessage: KoF красный, переходящий в
+# золото, Network белый. Ни Telegram, ни Discord градиентов в тексте не умеют —
+# у обоих разметка ограничена жирным, курсивом и моноширинным. Поэтому здесь
+# бренд опознаётся не цветом, а формой: одно слово, всегда одинаковое
+# написание, всегда с одним и тем же значком.
+
+BRAND = "KoFNetwork"
+
+#: Значок сети. Ставится перед названием везде, где оно появляется: это
+#: единственная замена цвету, доступная в мессенджерах.
+BRAND_MARK = "🔥"
+
+BRAND_TITLE = f"{BRAND_MARK} {BRAND}"
+
+#: Значки разделов. Собраны в одном месте, чтобы кнопка и заголовок экрана,
+#: на который она ведёт, не разъезжались: в Telegram они задаются в разных
+#: файлах, и без общего источника один из них рано или поздно отстаёт.
+ICON = {
+    "profile": "👤",
+    "security": "🛡",
+    "history": "🕘",
+    "sessions": "🔑",
+    "help": "❓",
+    "link": "🔗",
+    "unlink": "🔓",
+    "logout": "🚪",
+    "donate": "💎",
+    "approve": "✅",
+    "deny": "❌",
+    "bell_on": "🔔",
+    "bell_off": "🔕",
+    "back": "◀",
+    "warning": "⚠️",
+    "lock": "🔐",
+    "key": "🔑",
+    "site": "🌐",
+}
+
+#: Цвет полосы у эмбедов Discord — красный KoF. Единственное место, где
+#: фирменный цвет вообще доступен в мессенджере.
+BRAND_COLOUR = 0xFF2D2D
+DANGER_COLOUR = 0xE8505B
+ATTENTION_COLOUR = 0xFFB020
+
 # --------------------------------------------------------------------- общее
 
 NOT_LINKED = (
@@ -85,20 +131,34 @@ def yes_no(value: Any) -> str:
 # ------------------------------------------------------------------- экраны
 
 
-def profile_lines(profile: dict[str, Any]) -> list[str]:
-    """Строки экрана «Профиль» без платформенной разметки."""
+def profile_lines(profile: dict[str, Any], donate_url: str = "") -> list[str]:
+    """Строки экрана «Профиль» без платформенной разметки.
+
+    Показывается ровно то, что игроку о себе интересно: как его зовут, когда
+    он завёл аккаунт, когда заходил в последний раз и чем защищён.
+
+    UUID, статус, адрес и расположение убраны намеренно. UUID и статус игроку
+    ничего не говорят — это наши служебные поля. Адрес и город — данные, из-за
+    которых экран профиля нельзя показать другу, не открыв заодно, откуда ты
+    выходишь в сеть; при этом ни то, ни другое ничем не помогает: адрес входа
+    виден в «Истории», а разбор чужого входа — задача администратора, у него
+    для этого есть /auth player.
+
+    :param donate_url: если задан, в конце появляется строка поддержки сервера
+    """
     lines = [
         f"Ник: {profile.get('username', '—')}",
-        f"UUID: {profile.get('uuid', '—')}",
-        f"Статус: {profile.get('status', '—')}",
         f"Регистрация: {format_time(profile.get('registeredAt'))}",
         f"Последний вход: {format_time(profile.get('lastLoginAt'))}",
-        f"Адрес: {profile.get('lastLoginIp') or '—'}",
-        f"Расположение: {format_location(profile.get('country'), profile.get('city'))}",
         f"Второй фактор: {format_two_factor(profile)}",
     ]
     if profile.get("temporarilyLocked"):
-        lines.append(f"Временная блокировка до: {format_time(profile.get('lockedUntil'))}")
+        lines.append(
+            f"{ICON['warning']} Временная блокировка до: "
+            f"{format_time(profile.get('lockedUntil'))}"
+        )
+    if donate_url:
+        lines.extend(["", f"{ICON['donate']} Поддержать сервер: {donate_url}"])
     return lines
 
 
@@ -109,24 +169,6 @@ def security_lines(profile: dict[str, Any]) -> list[str]:
         f"Второй фактор: {format_two_factor(profile)}",
         f"CAPTCHA пройдена: {'да' if profile.get('captchaPassed') else 'нет'}",
     ]
-
-
-def device_lines(devices: list[dict[str, Any]]) -> list[str]:
-    if not devices:
-        return ["Устройств пока нет."]
-    lines = []
-    for device in devices:
-        marks = []
-        if device.get("trusted"):
-            marks.append("доверенное")
-        if device.get("blocked"):
-            marks.append("заблокировано")
-        suffix = f" · {', '.join(marks)}" if marks else ""
-        lines.append(
-            f"• {device.get('name', 'устройство')}\n"
-            f"  {device.get('ip', '—')} · {format_time(device.get('lastSeenAt'))}{suffix}"
-        )
-    return lines
 
 
 def history_lines(history: list[dict[str, Any]]) -> list[str]:
@@ -156,6 +198,13 @@ def session_lines(sessions: list[dict[str, Any]]) -> list[str]:
 
 
 def approval_request_lines(username: str, ip: str, location: str) -> list[str]:
+    """Запрос подтверждения входа.
+
+    Адрес и расположение здесь остаются, хотя из профиля убраны, и это не
+    противоречие: в профиле они отвечали на вопрос «где я живу», а тут — на
+    вопрос «я ли это сейчас захожу». Без них у владельца нет ничего, по чему
+    отличить свой вход от чужого, и кнопка «Войти» превращается в формальность.
+    """
     return [
         f"Вход в аккаунт {username}",
         "",
@@ -163,4 +212,15 @@ def approval_request_lines(username: str, ip: str, location: str) -> list[str]:
         f"Расположение: {location}",
         "",
         "Это вы?",
+    ]
+
+
+def link_code_lines(username: str, code: str, ttl: str) -> list[str]:
+    """Сообщение о выданном коде для служебного канала привязки."""
+    return [
+        f"Игрок: {username}",
+        f"Код: {code}",
+        "",
+        f"Отправьте боту /link {code} — код действует {ttl}"
+        " и сгорает после первого использования.",
     ]

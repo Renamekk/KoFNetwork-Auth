@@ -177,6 +177,7 @@ public final class RegisterCommand implements SimpleCommand {
                     }
                     player.sendMessage(messages.prefixed("register-success",
                             "<green>Аккаунт создан. Не забудьте привязать почту."));
+                    messages.welcomeTitle(player.getUsername()).ifPresent(player::showTitle);
                     transfer.toHub(player).thenAccept(outcome -> {
                         if (!outcome.success()) {
                             logger.error("Игрока {} не удалось перевести на хаб: {}",

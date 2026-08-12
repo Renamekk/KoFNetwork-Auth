@@ -5,7 +5,9 @@ import net.kofnetwork.auth.api.model.Device;
 import net.kofnetwork.auth.api.model.Role;
 import net.kofnetwork.auth.api.repository.AccountRepository;
 import net.kofnetwork.auth.api.repository.DeviceRepository;
+import net.kofnetwork.auth.api.repository.LoginHistoryRepository;
 import net.kofnetwork.auth.api.repository.RoleRepository;
+import net.kofnetwork.auth.api.repository.SessionRepository;
 import net.kofnetwork.auth.api.repository.SettingsRepository;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -30,15 +32,21 @@ public final class AdminOperations {
     private final DeviceRepository devices;
     private final RoleRepository roles;
     private final SettingsRepository settings;
+    private final LoginHistoryRepository history;
+    private final SessionRepository sessions;
 
     AdminOperations(@NotNull AccountRepository accounts,
                     @NotNull DeviceRepository devices,
                     @NotNull RoleRepository roles,
-                    @NotNull SettingsRepository settings) {
+                    @NotNull SettingsRepository settings,
+                    @NotNull LoginHistoryRepository history,
+                    @NotNull SessionRepository sessions) {
         this.accounts = accounts;
         this.devices = devices;
         this.roles = roles;
         this.settings = settings;
+        this.history = history;
+        this.sessions = sessions;
     }
 
     /**
@@ -127,6 +135,41 @@ public final class AdminOperations {
     public @NotNull CompletableFuture<java.util.Optional<net.kofnetwork.auth.api.model.Account>>
             findAccount(long accountId) {
         return accounts.findById(accountId);
+    }
+
+    /**
+     * Первый успешный вход аккаунта — с полным адресом.
+     *
+     * <p>Отдаётся доменная сущность, а не DTO: в DTO адрес маскирован, а разбор
+     * инцидента ведётся именно по полному. Наружу за пределы административных
+     * поверхностей это значение уходить не должно.
+     *
+     * <p>Пустой ответ означает, что запись не пережила срок хранения истории,
+     * а не что входов не было.
+     */
+    public @NotNull CompletableFuture<java.util.Optional<net.kofnetwork.auth.api.model.LoginAttempt>>
+            firstLogin(long accountId) {
+        return history.findFirstSuccessful(accountId);
+    }
+
+    /** Последний успешный вход аккаунта — с полным адресом. */
+    public @NotNull CompletableFuture<java.util.Optional<net.kofnetwork.auth.api.model.LoginAttempt>>
+            lastLogin(long accountId) {
+        return history.findLastSuccessful(accountId);
+    }
+
+    /**
+     * Действующие сессии аккаунта — с полными адресами.
+     *
+     * <p>Отличается от {@code SessionService.listSessions} тем, что отдаёт
+     * доменные сессии, а не DTO личного кабинета: в DTO адрес маскирован, потому
+     * что тот же список показывается игроку на сайте. Администратору маска мешает —
+     * по {@code 192.168.0.***} не сверить две сессии между собой и не отличить
+     * соседа по NAT от чужого человека.
+     */
+    public @NotNull CompletableFuture<List<net.kofnetwork.auth.api.model.Session>>
+            listSessions(long accountId) {
+        return sessions.findActiveByAccount(accountId, Instant.now());
     }
 
     /** Поиск аккаунтов по префиксу ника — для автодополнения. */

@@ -200,6 +200,14 @@ public interface CacheProvider extends AutoCloseable {
         public static final String IP_REPUTATION = "ipreputation:";
         public static final String NONCE = "nonce:";
 
+        /**
+         * Отметка «этот игрок имеет OP на игровом сервере».
+         *
+         * <p>Ставится плагином Paper, читается прокси: у Velocity своей системы
+         * прав нет, а {@code ops.json} лежит на другой машине.
+         */
+        public static final String OPERATOR = "operator:";
+
         /** Код привязки сайта: короткий, вводится игроком. */
         public static final String WEB_LINK_CODE = "weblink:code:";
 

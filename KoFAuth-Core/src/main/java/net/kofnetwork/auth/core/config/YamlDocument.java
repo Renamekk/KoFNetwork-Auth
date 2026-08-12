@@ -212,25 +212,34 @@ public final class YamlDocument {
         return parseDuration(String.valueOf(value).trim(), path);
     }
 
-    /** Разбирает запись длительности. Вынесено отдельно ради тестируемости. */
+    /**
+     * Разбирает запись длительности. Вынесено отдельно ради тестируемости.
+     *
+     * <p><b>Миллисекунды разбираются до односимвольных единиц.</b> Суффикс
+     * {@code ms} двухсимвольный, и проверка по последней букве видела в нём одно
+     * лишь {@code s}: остаток {@code "250m"} не превращался в число, и разбор
+     * падал. Из-за этого {@code fade-in: 250ms} в поставляемом {@code paper.yml} —
+     * запись, которую сама же поставка и предлагает, — роняла чтение настройки
+     * при каждой отправке титула в Limbo.
+     */
     static @NotNull Duration parseDuration(@NotNull String raw, @NotNull String path) {
         if (raw.isEmpty()) {
             throw new ConfigurationException("Пустое значение длительности в " + path);
         }
-        char suffix = raw.charAt(raw.length() - 1);
-        String digits = Character.isDigit(suffix) ? raw : raw.substring(0, raw.length() - 1);
+        String normalized = raw.trim();
+        String lower = normalized.toLowerCase(Locale.ROOT);
 
-        long amount;
-        try {
-            amount = Long.parseLong(digits.trim());
-        } catch (NumberFormatException e) {
-            throw new ConfigurationException(
-                    "Некорректная длительность в " + path + ": '" + raw
-                            + "'. Ожидается формат 30s, 15m, 24h или 7d.");
+        if (lower.length() > 2 && lower.endsWith("ms")) {
+            return Duration.ofMillis(amount(normalized.substring(0, normalized.length() - 2),
+                    raw, path));
         }
-        if (amount < 0) {
-            throw new ConfigurationException("Длительность в " + path + " не может быть отрицательной");
-        }
+
+        char suffix = normalized.charAt(normalized.length() - 1);
+        String digits = Character.isDigit(suffix)
+                ? normalized
+                : normalized.substring(0, normalized.length() - 1);
+        long amount = amount(digits, raw, path);
+
         return switch (Character.toLowerCase(suffix)) {
             case 's' -> Duration.ofSeconds(amount);
             case 'm' -> Duration.ofMinutes(amount);
@@ -242,9 +251,26 @@ public final class YamlDocument {
                 }
                 throw new ConfigurationException(
                         "Неизвестная единица длительности '" + suffix + "' в " + path
-                                + ". Допустимы s (секунды), m (минуты), h (часы), d (дни).");
+                                + ". Допустимы ms (миллисекунды), s (секунды), m (минуты), "
+                                + "h (часы), d (дни).");
             }
         };
+    }
+
+    /** Числовая часть записи длительности. */
+    private static long amount(String digits, String raw, String path) {
+        long amount;
+        try {
+            amount = Long.parseLong(digits.trim());
+        } catch (NumberFormatException e) {
+            throw new ConfigurationException(
+                    "Некорректная длительность в " + path + ": '" + raw
+                            + "'. Ожидается формат 250ms, 30s, 15m, 24h или 7d.");
+        }
+        if (amount < 0) {
+            throw new ConfigurationException("Длительность в " + path + " не может быть отрицательной");
+        }
+        return amount;
     }
 
     /** Список строк. Пустой список, если путь не найден. */

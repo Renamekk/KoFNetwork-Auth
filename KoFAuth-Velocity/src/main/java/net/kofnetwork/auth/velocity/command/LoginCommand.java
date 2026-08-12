@@ -228,6 +228,7 @@ public final class LoginCommand implements SimpleCommand {
                     }
                     player.sendMessage(messages.prefixed("login-success",
                             "<green>Вход выполнен. Приятной игры!"));
+                    messages.welcomeTitle(player.getUsername()).ifPresent(player::showTitle);
                     sendToHub(player);
                 });
     }

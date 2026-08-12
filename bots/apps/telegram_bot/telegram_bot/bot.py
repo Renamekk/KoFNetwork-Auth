@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import html
 import logging
+import os
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, Message
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.types import CallbackQuery, FSInputFile, Message
 from kofauth_common import (
     ApiUnavailable,
     BotMessage,
@@ -40,6 +41,17 @@ LOGGER = logging.getLogger(__name__)
 
 PLATFORM = "TELEGRAM"
 
+#: Префикс полезной нагрузки ссылки t.me/бот?start=…
+#:
+#: Ссылку показывает игра, и по ней бот получает код первым же сообщением —
+#: игроку не приходится ничего переписывать. Префикс нужен, чтобы не путать
+#: код привязки с другими возможными нагрузками start.
+LINK_PAYLOAD_PREFIX = "link_"
+
+#: Предел подписи к фотографии в Telegram. Текст длиннее просто не отправится,
+#: поэтому длинные экраны обрезаются, а не теряются целиком.
+CAPTION_LIMIT = 1024
+
 
 def esc(value: Any) -> str:
     """Экранирует HTML: ник приходит извне, а Telegram разбирает разметку."""
@@ -51,6 +63,25 @@ def block(title: str, lines: list[str]) -> str:
     return f"<b>{esc(title)}</b>\n\n{body}"
 
 
+def _clip(text: str) -> str:
+    """Укорачивает текст до предела подписи к фотографии.
+
+    Подпись длиннее 1024 символов Telegram не принимает вовсе — сообщение не
+    отправится. Обрезать по границе строки обязательно: разрыв посреди тега
+    ``<b>`` сделал бы разметку незакрытой, и Telegram отверг бы уже её.
+    """
+    if len(text) <= CAPTION_LIMIT:
+        return text
+    kept: list[str] = []
+    length = 0
+    for line in text.split("\n"):
+        if length + len(line) + 1 > CAPTION_LIMIT - 2:
+            break
+        kept.append(line)
+        length += len(line) + 1
+    return "\n".join(kept) + "\n…"
+
+
 class TelegramBot:
     """Сборка бота: обработчики, меню, уведомления."""
 
@@ -59,6 +90,10 @@ class TelegramBot:
         self._api = api
         self._bot = Bot(token=settings.telegram.token)
         self._dispatcher = Dispatcher()
+        #: ``file_id`` загруженного баннера. Telegram выдаёт его после первой
+        #: отправки, и дальше картинку можно не загружать заново — иначе каждый
+        #: /start означал бы выгрузку мегабайта на серверы Telegram.
+        self._banner_id: str | None = None
         self._register()
 
     @property
@@ -80,7 +115,6 @@ class TelegramBot:
         router.message.register(self._on_link, Command("link"))
         router.message.register(self._on_menu, Command("menu"))
         router.message.register(self._on_profile, Command("profile"))
-        router.message.register(self._on_devices, Command("devices"))
         router.message.register(self._on_history, Command("history"))
         router.message.register(self._on_security, Command("security"))
         router.message.register(self._on_unlink, Command("unlink"))
@@ -93,7 +127,24 @@ class TelegramBot:
 
     # ------------------------------------------------------------------ команды
 
-    async def _on_start(self, message: Message) -> None:
+    async def _on_start(self, message: Message, command: CommandObject) -> None:
+        """Начало разговора — и, возможно, сразу привязка.
+
+        Игра показывает ссылку ``t.me/бот?start=link_КОД``. Telegram передаёт
+        нагрузку первым же сообщением, поэтому переход по ссылке и есть
+        привязка: игроку не приходится переписывать восьмизначный код руками —
+        ровно тот барьер, из-за которого привязку не доводили до конца.
+
+        Код всё так же выдаётся только в игре. Ссылка меняет способ доставки
+        кода, а не направление привязки: получить код, не имея доступа к
+        игровому аккаунту, по-прежнему нельзя.
+        """
+        payload = (command.args or "").strip()
+        if payload.startswith(LINK_PAYLOAD_PREFIX):
+            code = payload[len(LINK_PAYLOAD_PREFIX):].strip()
+            if code:
+                await self._complete_link(message, code)
+                return
         await self._show_home(message)
 
     async def _on_menu(self, message: Message) -> None:
@@ -101,80 +152,132 @@ class TelegramBot:
 
     async def _show_home(self, message: Message) -> None:
         profile = await self._profile_or_none(message.from_user.id)
-        if profile is None:
-            await message.answer(
-                self._welcome_text(), parse_mode=ParseMode.HTML,
-                reply_markup=menu.main_menu(linked=False),
-            )
-            return
-        await message.answer(
-            self._home_text(profile), parse_mode=ParseMode.HTML,
-            reply_markup=menu.main_menu(linked=True),
-        )
+        linked = profile is not None
+        text = self._home_text(profile) if linked else self._welcome_text()
+        await self._send_screen(message, text, self._main_menu(linked))
+
+    def _main_menu(self, linked: bool):
+        return menu.main_menu(linked, donate_url=self._settings.brand.donate_url)
 
     def _welcome_text(self) -> str:
-        return (
-            "<b>KoF Network</b>\n\n"
-            "Я подтверждаю вход в игру и присылаю оповещения безопасности.\n\n"
-            "Чтобы начать, зайдите в игру, наберите <code>/telegram</code> "
-            "и пришлите мне полученный код:\n"
-            "<code>/link КОД</code>"
-        )
+        lines = [
+            f"<b>{esc(texts.BRAND_TITLE)}</b>",
+            "",
+            "Я подтверждаю вход в игру и присылаю оповещения безопасности.",
+            "",
+            f"{texts.ICON['link']} <b>Как привязать аккаунт</b>",
+            "1. Зайдите в игру",
+            "2. Наберите <code>/telegram</code>",
+            "3. Нажмите на ссылку в чате — привяжу сам",
+            "",
+            "Если ссылка не открылась, пришлите мне <code>/link КОД</code>.",
+        ]
+        return "\n".join(lines)
 
     def _home_text(self, profile: dict[str, Any]) -> str:
         return (
-            f"<b>KoF Network</b>\n\n"
-            f"Аккаунт: <b>{esc(profile.get('username', '—'))}</b>\n"
-            f"Последний вход: {esc(texts.format_time(profile.get('lastLoginAt')))}\n\n"
+            f"<b>{esc(texts.BRAND_TITLE)}</b>\n\n"
+            f"{texts.ICON['profile']} Аккаунт: <b>{esc(profile.get('username', '—'))}</b>\n"
+            f"{texts.ICON['history']} Последний вход: "
+            f"{esc(texts.format_time(profile.get('lastLoginAt')))}\n\n"
             f"Выберите раздел."
         )
 
-    async def _on_link(self, message: Message) -> None:
-        code = self._argument(message)
-        if not code:
-            await message.answer(
-                "Укажите код: <code>/link КОД</code>\n\n"
-                "Код берётся в игре командой <code>/telegram</code>.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
+    async def _complete_link(self, message: Message, code: str) -> None:
+        """Привязывает аккаунт по коду и сразу показывает главный экран."""
         result = await self._call(
             message, self._api.link(PLATFORM, code, message.from_user.id, message.chat.id)
         )
         if result is None:
             return
         if not result.ok:
-            await message.answer("❌ " + texts.describe_error(result.error))
+            await self._send_screen(
+                message,
+                f"{texts.ICON['deny']} {esc(texts.describe_error(result.error))}",
+                self._main_menu(linked=False),
+            )
             return
 
-        await message.answer(
-            f"✅ Аккаунт <b>{esc(result.data.get('username', ''))}</b> привязан.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=menu.main_menu(linked=True),
+        await self._send_screen(
+            message,
+            f"{texts.ICON['approve']} Аккаунт "
+            f"<b>{esc(result.data.get('username', ''))}</b> привязан.\n\n"
+            "Теперь подтверждение входа приходит сюда кнопками.",
+            self._main_menu(linked=True),
         )
+
+    # ------------------------------------------------------------------ баннер
+
+    async def _send_screen(self, message: Message, text: str, markup) -> None:
+        """Отправляет экран — с баннером, если он настроен.
+
+        Баннер идёт картинкой с подписью, а не отдельным сообщением: так экран
+        остаётся одним сообщением, которое кнопки перерисовывают, и в чате не
+        копится лента из картинки и текста к ней.
+        """
+        photo = self._banner()
+        if photo is None:
+            await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+        try:
+            sent = await message.answer_photo(
+                photo, caption=_clip(text), parse_mode=ParseMode.HTML, reply_markup=markup
+            )
+        except Exception as exc:  # noqa: BLE001 — путь к файлу мог оказаться неверным
+            # Без баннера бот работает; молча не показать ничего — нет.
+            LOGGER.warning("Баннер не отправлен (%s), показываю без картинки", exc)
+            self._banner_id = None
+            await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
+        if sent.photo:
+            # Дальше пользуемся выданным идентификатором: повторная выгрузка
+            # той же картинки на каждый /start — трафик впустую.
+            self._banner_id = sent.photo[-1].file_id
+
+    def _banner(self):
+        """Что отправлять как баннер: ``file_id``, локальный файл или ссылку."""
+        if self._banner_id:
+            return self._banner_id
+        path = self._settings.brand.banner_file
+        if path and os.path.isfile(path):
+            return FSInputFile(path)
+        return self._settings.brand.banner_url or None
+
+    async def _on_link(self, message: Message) -> None:
+        code = self._argument(message)
+        if not code:
+            await message.answer(
+                "Укажите код: <code>/link КОД</code>\n\n"
+                "Код берётся в игре командой <code>/telegram</code> — "
+                "там же есть ссылка, по которой привязка происходит сама.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await self._complete_link(message, code)
 
     async def _on_profile(self, message: Message) -> None:
         profile = await self._require_profile(message)
         if profile is not None:
             await message.answer(
-                block("Профиль", texts.profile_lines(profile)),
+                block(f"{texts.ICON['profile']} Профиль", self._profile_lines(profile)),
                 parse_mode=ParseMode.HTML, reply_markup=menu.back_only(),
             )
 
-    async def _on_devices(self, message: Message) -> None:
-        await self._send_list(message, self._api.devices(PLATFORM, message.from_user.id),
-                              "Устройства", "devices", texts.device_lines)
+    def _profile_lines(self, profile: dict[str, Any]) -> list[str]:
+        return texts.profile_lines(profile, donate_url=self._settings.brand.donate_url)
 
     async def _on_history(self, message: Message) -> None:
         await self._send_list(message, self._api.history(PLATFORM, message.from_user.id),
-                              "Последние входы", "history", texts.history_lines)
+                              f"{texts.ICON['history']} Последние входы",
+                              "history", texts.history_lines)
 
     async def _on_security(self, message: Message) -> None:
         profile = await self._require_profile(message)
         if profile is not None:
             await message.answer(
-                block("Защита аккаунта", texts.security_lines(profile)),
+                block(f"{texts.ICON['security']} Защита аккаунта",
+                      texts.security_lines(profile)),
                 parse_mode=ParseMode.HTML,
                 reply_markup=menu.security_menu(bool(profile.get("loginApproval"))),
             )
@@ -190,23 +293,33 @@ class TelegramBot:
                              reply_markup=menu.back_only())
 
     def _help_text(self) -> str:
-        return (
-            "<b>Справка</b>\n\n"
-            "<b>Как привязать аккаунт</b>\n"
-            "1. Зайдите в игру\n"
-            "2. Наберите <code>/telegram</code>\n"
-            "3. Пришлите мне <code>/link КОД</code>\n\n"
-            "Код выдаётся только в игре — это единственный способ доказать, "
-            "что аккаунт ваш.\n\n"
-            "<b>Команды</b>\n"
-            "/menu — главное меню\n"
-            "/profile — сведения об аккаунте\n"
-            "/security — защита и подтверждение входа\n"
-            "/devices — устройства\n"
-            "/history — история входов\n"
-            "/unlink — отвязать Telegram\n\n"
-            f"Личный кабинет: {esc(self._settings.panel_url)}"
-        )
+        lines = [
+            f"<b>{texts.ICON['help']} Справка</b>",
+            "",
+            f"<b>{texts.ICON['link']} Как привязать аккаунт</b>",
+            "1. Зайдите в игру",
+            "2. Наберите <code>/telegram</code>",
+            "3. Нажмите на ссылку в чате — я привяжу аккаунт сам",
+            "",
+            "Не открылась ссылка — пришлите <code>/link КОД</code>.",
+            "Код выдаётся только в игре: это единственный способ доказать, "
+            "что аккаунт ваш.",
+            "",
+            f"<b>{texts.ICON['key']} Команды</b>",
+            "/menu — главное меню",
+            "/profile — сведения об аккаунте",
+            "/security — защита и подтверждение входа",
+            "/history — история входов",
+            "/unlink — отвязать Telegram",
+            "",
+            f"{texts.ICON['site']} Личный кабинет: {esc(self._settings.panel_url)}",
+        ]
+        if self._settings.brand.donate_url:
+            lines.append(
+                f"{texts.ICON['donate']} Поддержать сервер: "
+                f"{esc(self._settings.brand.donate_url)}"
+            )
+        return "\n".join(lines)
 
     async def _on_login_hint(self, message: Message) -> None:
         await message.answer(
@@ -229,33 +342,30 @@ class TelegramBot:
         if screen == menu.HOME:
             profile = await self._profile_or_none(user_id)
             text = self._home_text(profile) if profile else self._welcome_text()
-            await self._edit(query, text, menu.main_menu(linked=profile is not None))
+            await self._edit(query, text, self._main_menu(linked=profile is not None))
             return
 
         profile = await self._profile_or_none(user_id)
         if profile is None:
-            await self._edit(query, self._welcome_text(), menu.main_menu(linked=False))
+            await self._edit(query, self._welcome_text(), self._main_menu(linked=False))
             return
 
         if screen == menu.PROFILE:
-            await self._edit(query, block("Профиль", texts.profile_lines(profile)),
+            await self._edit(query, block(f"{texts.ICON['profile']} Профиль",
+                                          self._profile_lines(profile)),
                              menu.back_only())
         elif screen == menu.SECURITY:
-            await self._edit(query, block("Защита аккаунта", texts.security_lines(profile)),
+            await self._edit(query, block(f"{texts.ICON['security']} Защита аккаунта",
+                                          texts.security_lines(profile)),
                              menu.security_menu(bool(profile.get("loginApproval"))))
-        elif screen == menu.DEVICES:
-            result = await self._api.devices(PLATFORM, user_id)
-            await self._edit(query, block("Устройства",
-                                          texts.device_lines(result.data.get("devices", []))),
-                             menu.back_only())
         elif screen == menu.HISTORY:
             result = await self._api.history(PLATFORM, user_id)
-            await self._edit(query, block("Последние входы",
+            await self._edit(query, block(f"{texts.ICON['history']} Последние входы",
                                           texts.history_lines(result.data.get("history", []))),
                              menu.back_only())
         elif screen == menu.SESSIONS:
             result = await self._api.sessions(PLATFORM, user_id)
-            await self._edit(query, block("Активные сессии",
+            await self._edit(query, block(f"{texts.ICON['sessions']} Активные сессии",
                                           texts.session_lines(result.data.get("sessions", []))),
                              menu.back_only())
         await query.answer()
@@ -268,7 +378,8 @@ class TelegramBot:
             enabled = action.endswith(":on")
             result = await self._api.set_login_approval(PLATFORM, user_id, enabled)
             profile = result.data if result.ok else await self._api_profile(user_id)
-            await self._edit(query, block("Защита аккаунта", texts.security_lines(profile)),
+            await self._edit(query, block(f"{texts.ICON['security']} Защита аккаунта",
+                                          texts.security_lines(profile)),
                              menu.security_menu(bool(profile.get("loginApproval"))))
             await query.answer("Готово" if result.ok else "Не получилось")
             return
@@ -284,7 +395,7 @@ class TelegramBot:
         if action == "unlink:ask":
             await self._edit(
                 query,
-                "Отвязать Telegram?\n\n"
+                f"{texts.ICON['warning']} <b>Отвязать Telegram?</b>\n\n"
                 "Подтверждение входа и уведомления перестанут работать.",
                 menu.confirm_unlink(),
             )
@@ -295,8 +406,9 @@ class TelegramBot:
             result = await self._api.unlink(PLATFORM, user_id)
             await self._edit(
                 query,
-                "Аккаунт отвязан." if result.ok else "❌ " + texts.describe_error(result.error),
-                menu.main_menu(linked=not result.ok),
+                f"{texts.ICON['unlink']} Аккаунт отвязан." if result.ok
+                else f"{texts.ICON['deny']} " + esc(texts.describe_error(result.error)),
+                self._main_menu(linked=not result.ok),
             )
             await query.answer()
 
@@ -365,7 +477,7 @@ class TelegramBot:
         )
         await self._safe_send(
             message.chat_id or message.recipient_id,
-            "🔐 <b>" + esc(lines[0]) + "</b>\n\n"
+            f"{texts.ICON['lock']} <b>" + esc(lines[0]) + "</b>\n\n"
             + "\n".join(esc(x) for x in lines[1:]),
             menu.approval_keyboard(message.get("approvalId")),
         )
@@ -416,9 +528,21 @@ class TelegramBot:
             return None
 
     async def _edit(self, query: CallbackQuery, text: str, markup) -> None:
+        """Перерисовывает экран на месте.
+
+        <p>У сообщения с баннером правится подпись, а не текст: ``edit_text``
+        на сообщении с фотографией Telegram отвергает — там нечего править,
+        текста у такого сообщения нет вовсе. Без этой ветки навигация по меню
+        переставала работать ровно после включения баннера.
+        """
         try:
-            await query.message.edit_text(text, parse_mode=ParseMode.HTML,
-                                          reply_markup=markup)
+            if query.message.photo:
+                await query.message.edit_caption(
+                    caption=_clip(text), parse_mode=ParseMode.HTML, reply_markup=markup
+                )
+            else:
+                await query.message.edit_text(text, parse_mode=ParseMode.HTML,
+                                              reply_markup=markup)
         except TelegramBadRequest as exc:
             # «message is not modified» — обычное дело при повторном нажатии
             # той же кнопки и не ошибка для человека.

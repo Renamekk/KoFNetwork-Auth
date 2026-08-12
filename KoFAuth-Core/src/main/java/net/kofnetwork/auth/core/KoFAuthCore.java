@@ -18,6 +18,7 @@ import net.kofnetwork.auth.api.service.SecurityService;
 import net.kofnetwork.auth.api.service.SessionService;
 import net.kofnetwork.auth.api.service.TokenService;
 import net.kofnetwork.auth.api.service.TotpService;
+import net.kofnetwork.auth.core.admin.OperatorRegistry;
 import net.kofnetwork.auth.core.cache.CacheProvider;
 import net.kofnetwork.auth.core.cache.LocalCacheProvider;
 import net.kofnetwork.auth.core.cache.RedisCacheProvider;
@@ -110,6 +111,7 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
     private final BotOutboxRepository botOutbox;
     private final AuditServiceImpl audit;
     private final AdminOperations adminOperations;
+    private final OperatorRegistry operators;
     private final AccountTransfer transfer;
     private final EmailNotificationListener emailNotifications;
     private final BotNotificationListener botNotifications;
@@ -210,7 +212,9 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
         this.authentication = authenticationService;
         approvalService.attachCompleter(authenticationService::completeApprovedLogin);
 
-        this.adminOperations = new AdminOperations(accountRepo, deviceRepo, roleRepo, settingsRepo);
+        this.adminOperations = new AdminOperations(accountRepo, deviceRepo, roleRepo, settingsRepo,
+                historyRepo, sessionRepo);
+        this.operators = new OperatorRegistry(cache);
         this.transfer = new AccountTransfer(accountRepo, executors.io());
 
         // Уведомления подключаются подписчиком, а не вызовами из сервисов:
@@ -486,6 +490,18 @@ public final class KoFAuthCore implements KoFAuth, AutoCloseable {
      */
     public @NotNull AdminOperations adminOperations() {
         return adminOperations;
+    }
+
+    /**
+     * Реестр операторов игровых серверов.
+     *
+     * <p>Заполняет его плагин Paper, читает прокси: OP — понятие Bukkit, а у
+     * Velocity ни своей системы прав, ни доступа к {@code ops.json} бэкенда нет.
+     *
+     * @see OperatorRegistry
+     */
+    public @NotNull OperatorRegistry operators() {
+        return operators;
     }
 
     /**

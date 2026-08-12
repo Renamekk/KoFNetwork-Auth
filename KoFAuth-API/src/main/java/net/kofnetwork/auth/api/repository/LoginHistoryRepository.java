@@ -50,6 +50,19 @@ public interface LoginHistoryRepository {
     /** Последний успешный вход аккаунта. */
     @NotNull CompletableFuture<java.util.Optional<LoginAttempt>> findLastSuccessful(long accountId);
 
+    /**
+     * Самый первый успешный вход аккаунта.
+     *
+     * <p>Нужен разбору инцидентов: адрес регистрации показывает, откуда аккаунт
+     * создан, но не откуда им начали пользоваться. При угоне сразу после
+     * регистрации это разные адреса, и по одному лишь адресу регистрации
+     * подмену не увидеть.
+     *
+     * <p>Записи истории чистятся по сроку хранения, поэтому у старого аккаунта
+     * ответ может быть пуст — это не ошибка, а исчерпанная ретенция.
+     */
+    @NotNull CompletableFuture<java.util.Optional<LoginAttempt>> findFirstSuccessful(long accountId);
+
     /** Удаляет записи старше указанного момента. */
     @NotNull CompletableFuture<Integer> deleteBefore(@NotNull Instant before);
 }

@@ -79,7 +79,74 @@ public final class KoFAuthPaper extends JavaPlugin implements Listener {
 
         getServer().getPluginManager().registerEvents(this, this);
         startReadinessWatch();
+        startOperatorPublishing();
         getLogger().info("KoFAuth запущен");
+    }
+
+    /**
+     * Сообщает прокси, у кого из игроков есть OP.
+     *
+     * <p><b>Зачем.</b> Администратор ожидает, что выданный себе OP работает и в
+     * {@code /auth}. Но OP живёт в {@code ops.json} игрового сервера, а Velocity
+     * собственной системы прав не имеет вовсе и без стороннего плагина отвечает
+     * {@code UNDEFINED} на любой запрос. Файла бэкенда прокси тоже не видит — это
+     * другой процесс, нередко и другая машина. Единственное, что у них общее, —
+     * хранилище состояния, через него признак и передаётся.
+     *
+     * <p>Отметка обновляется по таймеру, а не ставится один раз при входе: у неё
+     * короткий срок жизни, поэтому выключенный бэкенд перестаёт наделять правами
+     * сам собой, без необходимости что-либо чистить. По той же причине снятый OP
+     * перестаёт действовать в пределах минут — обновление его уже не продлит.
+     */
+    private void startOperatorPublishing() {
+        if (!core.config().getBoolean(ConfigFile.PAPER, "operators.publish", true)) {
+            return;
+        }
+        Duration refresh = core.config().getDuration(ConfigFile.PAPER,
+                "operators.refresh", Duration.ofMinutes(1));
+        long ticks = Math.max(20L, refresh.toSeconds() * 20L);
+
+        getServer().getScheduler().runTaskTimer(this, () -> {
+            for (Player player : getServer().getOnlinePlayers()) {
+                publishOperator(player);
+            }
+        }, 20L, ticks);
+    }
+
+    /**
+     * Ставит или снимает отметку оператора для одного игрока.
+     *
+     * <p>Снятие выполняется явно, а не оставляется на истечение срока: между
+     * {@code /deop} и следующим обновлением иначе оставалось бы окно, в котором
+     * снятие выглядит не сработавшим.
+     */
+    private void publishOperator(Player player) {
+        UUID uuid = player.getUniqueId();
+        boolean op = player.isOp();
+        var future = op
+                ? core.operators().mark(uuid, operatorTtl())
+                : core.operators().clear(uuid);
+
+        future.exceptionally(e -> {
+            // Хранилище недоступно. Прокси в этом случае считает игрока не
+            // оператором — подниматься до полного доступа по отказу Redis нельзя.
+            getLogger().warning("Не удалось передать признак OP игрока "
+                    + player.getName() + ": " + e);
+            return null;
+        });
+    }
+
+    /**
+     * Срок жизни отметки.
+     *
+     * <p>Заведомо больше периода обновления: иначе отметка успевала бы истечь
+     * между двумя обновлениями, и права администратора моргали бы.
+     */
+    private Duration operatorTtl() {
+        Duration refresh = core.config().getDuration(ConfigFile.PAPER,
+                "operators.refresh", Duration.ofMinutes(1));
+        Duration ttl = refresh.multipliedBy(4);
+        return ttl.compareTo(Duration.ofMinutes(1)) < 0 ? Duration.ofMinutes(1) : ttl;
     }
 
     /**
@@ -359,6 +426,12 @@ public final class KoFAuthPaper extends JavaPlugin implements Listener {
     public void onJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
 
+        // Прокси узнаёт об OP только отсюда, и ждать до первого срабатывания
+        // таймера незачем: администратор набирает /auth сразу после входа.
+        if (core.config().getBoolean(ConfigFile.PAPER, "operators.publish", true)) {
+            publishOperator(player);
+        }
+
         core.sessions().hasValidSession(player.getUniqueId()).thenAccept(authenticated -> {
             if (mode == Mode.BACKEND) {
                 handleBackendJoin(player, authenticated);
@@ -493,6 +566,12 @@ public final class KoFAuthPaper extends JavaPlugin implements Listener {
         // Иначе множество растёт на каждого зашедшего и никогда не уменьшается,
         // а вернувшийся игрок не увидит плавного появления надписи.
         titled.remove(uuid);
+
+        // Вышедший игрок оператором сети не считается: иначе отметка жила бы
+        // до истечения срока и наделяла правами того, кого на серверах нет.
+        if (core != null && core.config().getBoolean(ConfigFile.PAPER, "operators.publish", true)) {
+            core.operators().clear(uuid).exceptionally(e -> null);
+        }
     }
 
     @Override

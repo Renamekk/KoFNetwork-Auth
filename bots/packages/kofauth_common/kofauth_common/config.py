@@ -113,6 +113,7 @@ class DiscordSettings:
     token: str
     guild_id: str = ""
     admin_channel_id: str = ""
+    account_channel_id: str = ""
 
     def validate(self) -> None:
         if not self.token:
@@ -127,6 +128,37 @@ class DiscordSettings:
         """
         return int(self.guild_id) if self.guild_id.isdigit() else None
 
+    @property
+    def account_channel_id_int(self) -> int | None:
+        """Канал привязки: туда игрок приходит по ссылке из игры.
+
+        Пусто — публиковать некуда, и сообщения этого рода просто не
+        отправляются. Отсутствие канала не ошибка: привязка работает и без него.
+        """
+        return int(self.account_channel_id) if self.account_channel_id.isdigit() else None
+
+
+@dataclass(frozen=True, slots=True)
+class BrandSettings:
+    """Оформление: то, что делает бота узнаваемым, а не работающим.
+
+    Вынесено отдельно, потому что ничего из этого не влияет на поведение: без
+    баннера и ссылки на донат бот работает ровно так же, просто выглядит голым.
+    Поэтому и проверок здесь нет — пустое значение означает «не показывать».
+
+    :param banner_url: изображение шапки; должно быть доступно по HTTP как
+        Discord, так и Telegram — оба скачивают его своими серверами
+    :param banner_file: локальный файл на случай, когда выкладывать баннер
+        наружу незачем. Telegram загружает его один раз и дальше пользуется
+        выданным ``file_id``; Discord умеет только ссылку
+    :param donate_url: страница поддержки сервера, показывается в профиле
+    """
+
+    banner_url: str = ""
+    banner_file: str = ""
+    donate_url: str = ""
+    site_url: str = ""
+
 
 @dataclass(frozen=True, slots=True)
 class Settings:
@@ -135,6 +167,7 @@ class Settings:
     api: ApiSettings
     telegram: TelegramSettings
     discord: DiscordSettings
+    brand: BrandSettings
     panel_url: str
     log_level: str
 
@@ -165,6 +198,13 @@ class Settings:
                 token=_env("KOFAUTH_DISCORD_BOT_TOKEN"),
                 guild_id=_env("KOFAUTH_DISCORD_GUILD_ID"),
                 admin_channel_id=_env("KOFAUTH_DISCORD_ADMIN_CHANNEL_ID"),
+                account_channel_id=_env("KOFAUTH_DISCORD_ACCOUNT_CHANNEL_ID"),
+            ),
+            brand=BrandSettings(
+                banner_url=_env("KOFAUTH_BANNER_URL"),
+                banner_file=_env("KOFAUTH_BANNER_FILE"),
+                donate_url=_env("KOFAUTH_DONATE_URL"),
+                site_url=_env("KOFAUTH_SITE_URL"),
             ),
             panel_url=_env("KOFAUTH_PANEL_URL", "http://127.0.0.1:8080"),
             log_level=_env("KOFAUTH_LOG_LEVEL", "INFO").upper(),

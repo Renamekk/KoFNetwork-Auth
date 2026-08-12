@@ -206,3 +206,8 @@ LOGIN_APPROVAL = "LOGIN_APPROVAL"
 LOGIN_APPROVAL_RESOLVED = "LOGIN_APPROVAL_RESOLVED"
 LOGIN_NOTICE = "LOGIN_NOTICE"
 SECURITY_NOTICE = "SECURITY_NOTICE"
+
+#: Код привязки для публикации в служебном канале. Личного получателя у этого
+#: сообщения нет: игрок ещё не привязан, и написать ему лично невозможно —
+#: именно этим привязка и начинается. Канал бот берёт из своей конфигурации.
+LINK_CODE = "LINK_CODE"

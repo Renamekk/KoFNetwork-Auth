@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from kofauth_common.texts import ICON
 
 # Префикс отделяет навигацию от кнопок подтверждения входа: обработчик
 # подтверждения не должен реагировать на переход по меню и наоборот.
@@ -21,7 +22,6 @@ ACTION = "act"
 HOME = "home"
 PROFILE = "profile"
 SECURITY = "security"
-DEVICES = "devices"
 HISTORY = "history"
 SESSIONS = "sessions"
 HELP = "help"
@@ -35,28 +35,46 @@ def _action(text: str, name: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=f"{ACTION}:{name}")
 
 
-def main_menu(linked: bool) -> InlineKeyboardMarkup:
+def main_menu(linked: bool, donate_url: str = "") -> InlineKeyboardMarkup:
     """Главный экран.
 
-    До привязки показывать «Устройства» и «История» бессмысленно: нажатие
-    привело бы к одному и тому же ответу «аккаунт не привязан». Поэтому у
-    непривязанного человека ровно один осмысленный путь.
+    До привязки показывать «История» и «Сессии» бессмысленно: нажатие привело бы
+    к одному и тому же ответу «аккаунт не привязан». Поэтому у непривязанного
+    человека ровно один осмысленный путь.
+
+    Раздела «Устройства» здесь больше нет: он показывал те же адреса, что и
+    «История», только в другом порядке, и ни одной кнопки к ним не прилагалось —
+    смотреть список, с которым нечего сделать, незачем.
     """
     builder = InlineKeyboardBuilder()
     if not linked:
-        builder.row(_button("🔗 Как привязать аккаунт", HELP))
+        builder.row(_button(f"{ICON['link']} Как привязать аккаунт", HELP))
+        if donate_url:
+            builder.row(_link(f"{ICON['donate']} Поддержать сервер", donate_url))
         return builder.as_markup()
 
-    builder.row(_button("👤 Профиль", PROFILE), _button("🛡 Защита", SECURITY))
-    builder.row(_button("💻 Устройства", DEVICES), _button("🕘 История", HISTORY))
-    builder.row(_button("🔑 Сессии", SESSIONS))
-    builder.row(_button("❓ Справка", HELP))
+    builder.row(
+        _button(f"{ICON['profile']} Профиль", PROFILE),
+        _button(f"{ICON['security']} Защита", SECURITY),
+    )
+    builder.row(
+        _button(f"{ICON['history']} История", HISTORY),
+        _button(f"{ICON['sessions']} Сессии", SESSIONS),
+    )
+    builder.row(_button(f"{ICON['help']} Справка", HELP))
+    if donate_url:
+        builder.row(_link(f"{ICON['donate']} Поддержать сервер", donate_url))
     return builder.as_markup()
+
+
+def _link(text: str, url: str) -> InlineKeyboardButton:
+    """Кнопка-ссылка. Telegram открывает её сам, обработчик не нужен."""
+    return InlineKeyboardButton(text=text, url=url)
 
 
 def back_only() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(_button("‹ Назад", HOME))
+    builder.row(_button(f"{ICON['back']} Назад", HOME))
     return builder.as_markup()
 
 
@@ -70,13 +88,14 @@ def security_menu(login_approval: bool) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         _action(
-            "🔕 Выключить подтверждение" if login_approval else "🔔 Включить подтверждение",
+            f"{ICON['bell_off']} Выключить подтверждение" if login_approval
+            else f"{ICON['bell_on']} Включить подтверждение",
             "approval:off" if login_approval else "approval:on",
         )
     )
-    builder.row(_action("🚪 Выйти со всех устройств", "logout"))
-    builder.row(_action("🔓 Отвязать Telegram", "unlink:ask"))
-    builder.row(_button("‹ Назад", HOME))
+    builder.row(_action(f"{ICON['logout']} Выйти со всех устройств", "logout"))
+    builder.row(_action(f"{ICON['unlink']} Отвязать Telegram", "unlink:ask"))
+    builder.row(_button(f"{ICON['back']} Назад", HOME))
     return builder.as_markup()
 
 
@@ -108,7 +127,11 @@ def approval_keyboard(approval_id: str) -> InlineKeyboardMarkup:
     """
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="✅ Войти", callback_data=f"ok:{approval_id}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"no:{approval_id}"),
+        InlineKeyboardButton(
+            text=f"{ICON['approve']} Войти", callback_data=f"ok:{approval_id}"
+        ),
+        InlineKeyboardButton(
+            text=f"{ICON['deny']} Отклонить", callback_data=f"no:{approval_id}"
+        ),
     )
     return builder.as_markup()

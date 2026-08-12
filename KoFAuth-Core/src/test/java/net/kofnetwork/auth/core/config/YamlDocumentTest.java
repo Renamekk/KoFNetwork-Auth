@@ -72,6 +72,35 @@ class YamlDocumentTest {
                 .isEqualTo(Duration.ofSeconds(expectedSeconds));
     }
 
+    @ParameterizedTest
+    @CsvSource({
+            "250ms, 250",
+            "40ms,  40",
+            "1000MS, 1000"
+    })
+    void разбирает_миллисекунды(String raw, long expectedMillis) {
+        // Суффикс двухсимвольный, и проверка по последней букве видела в нём
+        // одно лишь 's': остаток «250m» не превращался в число. Из-за этого
+        // fade-in: 250ms — запись из поставляемого paper.yml — роняла чтение
+        // настройки при каждой отправке титула в Limbo.
+        assertThat(YamlDocument.parseDuration(raw, "путь"))
+                .isEqualTo(Duration.ofMillis(expectedMillis));
+    }
+
+    @Test
+    void одиночное_m_остаётся_минутами() {
+        // Разбор миллисекунд не должен переопределять минуты: 15m — это
+        // пятнадцать минут во всех остальных местах конфигурации.
+        assertThat(YamlDocument.parseDuration("15m", "путь"))
+                .isEqualTo(Duration.ofMinutes(15));
+    }
+
+    @Test
+    void единица_без_числа_отвергается() {
+        assertThatThrownBy(() -> YamlDocument.parseDuration("ms", "путь"))
+                .isInstanceOf(ConfigurationException.class);
+    }
+
     @Test
     void отвергает_неизвестную_единицу_длительности() {
         assertThatThrownBy(() -> YamlDocument.parseDuration("30x", "путь"))

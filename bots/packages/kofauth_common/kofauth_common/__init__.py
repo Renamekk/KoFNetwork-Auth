@@ -6,8 +6,9 @@
 """
 
 from .api import ApiResult, ApiUnavailable, KoFAuthApi
-from .config import ConfigurationError, OutboxSettings, Settings
+from .config import BrandSettings, ConfigurationError, OutboxSettings, Settings
 from .events import (
+    LINK_CODE,
     LOGIN_APPROVAL,
     LOGIN_APPROVAL_RESOLVED,
     LOGIN_NOTICE,
@@ -20,7 +21,9 @@ __all__ = [
     "ApiResult",
     "ApiUnavailable",
     "BotMessage",
+    "BrandSettings",
     "ConfigurationError",
+    "LINK_CODE",
     "LOGIN_APPROVAL",
     "LOGIN_APPROVAL_RESOLVED",
     "LOGIN_NOTICE",

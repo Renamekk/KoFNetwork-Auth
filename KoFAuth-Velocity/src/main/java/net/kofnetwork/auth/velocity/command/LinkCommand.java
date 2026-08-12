@@ -6,6 +6,8 @@ import com.velocitypowered.api.proxy.Player;
 import net.kofnetwork.auth.api.config.ConfigFile;
 import net.kofnetwork.auth.api.dto.AuthContext;
 import net.kofnetwork.auth.api.model.Account;
+import net.kofnetwork.auth.api.model.BotMessage;
+import net.kofnetwork.auth.api.model.BotPlatform;
 import net.kofnetwork.auth.api.model.IpAddress;
 import net.kofnetwork.auth.api.result.OperationResult;
 import net.kofnetwork.auth.api.service.LinkService;
@@ -17,8 +19,10 @@ import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
@@ -145,6 +149,20 @@ public final class LinkCommand implements SimpleCommand {
         });
     }
 
+    /**
+     * Выдаёт код привязки и показывает его кликабельно.
+     *
+     * <p><b>Почему кликабельно.</b> Раньше игроку оставалось переписать
+     * восьмизначный код в другое приложение руками — на телефоне это ровно тот
+     * барьер, из-за которого привязку не доводят до конца. Теперь код сам
+     * копируется в буфер по нажатию, а у Telegram есть и прямой переход:
+     * {@code t.me/бот?start=link_КОД} открывает чат с уже подставленным кодом,
+     * и бот привязывает аккаунт сам, без единого набранного символа.
+     *
+     * <p>У Discord такого перехода нет и быть не может: slash-команду ссылкой не
+     * предзаполнить. Поэтому там ссылка ведёт в канал привязки, а код едет туда
+     * же отдельным сообщением, если это включено в {@code discord.yml}.
+     */
     private void issueCode(Player player, Account account) {
         createCode(account.id(), contextOf(player)).thenAccept(result -> {
             if (!result.isSuccess()) {
@@ -152,16 +170,117 @@ public final class LinkCommand implements SimpleCommand {
                 return;
             }
             LinkService.LinkCode code = result.value();
-            player.sendMessage(prefixed("<green>Код привязки: <white><bold>" + code.code()));
+            String command = "/link " + code.code();
 
-            String where = kind == Kind.TELEGRAM
-                    ? "боту " + botName()
-                    : "боту на сервере Discord";
+            // Сам код — кнопка: нажатие кладёт его в буфер обмена.
+            player.sendMessage(prefixed("<green>Код привязки: "
+                    + "<click:copy_to_clipboard:'" + code.code() + "'>"
+                    + "<hover:show_text:'<gray>Нажмите, чтобы скопировать код'>"
+                    + "<white><bold>" + code.code() + "</bold></white></hover></click>"
+                    + " <dark_gray>(нажмите, чтобы скопировать)"));
+
+            deepLink(code.code()).map(LinkCommand::escapeTag).ifPresent(url ->
+                    player.sendMessage(miniMessage.deserialize(
+                            "  <click:open_url:'" + url + "'>"
+                                    + "<hover:show_text:'<gray>" + url + "'>"
+                                    + "<aqua><underlined>" + openLabel() + "</underlined></aqua>"
+                                    + "</hover></click>")));
+
+            // Запасной путь остаётся всегда: ссылку может не открыть лаунчер,
+            // а перехода к slash-команде Discord не существует вовсе.
             player.sendMessage(miniMessage.deserialize(
-                    "  <gray>Отправьте <white>/link " + code.code() + " <gray>" + where));
+                    "  <gray>Или отправьте <click:copy_to_clipboard:'" + command + "'>"
+                            + "<hover:show_text:'<gray>Нажмите, чтобы скопировать команду'>"
+                            + "<white>" + command + "</white></hover></click> <gray>"
+                            + (kind == Kind.TELEGRAM ? "боту " + botName() : "боту в Discord")));
+
             player.sendMessage(miniMessage.deserialize(
-                    "  <gray>Код действует " + humanize(code.ttl()) + " и сгорает после первого использования."));
+                    "  <dark_gray>Код действует " + humanize(code.ttl())
+                            + " и сгорает после первого использования."));
+
+            publishToChannel(player, code);
         });
+    }
+
+    /**
+     * Ссылка, ведущая прямо к привязке.
+     *
+     * <p>Telegram понимает параметр {@code start}: бот получает его первым
+     * сообщением и завершает привязку сам. Discord ничего подобного не умеет,
+     * поэтому там ссылка ведёт в канал или на приглашение — если они настроены.
+     */
+    private java.util.Optional<String> deepLink(String code) {
+        if (kind == Kind.TELEGRAM) {
+            String username = core.config().getString(ConfigFile.TELEGRAM, "bot.username", "").trim();
+            if (username.isBlank()) {
+                return java.util.Optional.empty();
+            }
+            return java.util.Optional.of("https://t.me/"
+                    + username.replace("@", "") + "?start=link_" + code);
+        }
+
+        String guild = core.config().getString(ConfigFile.DISCORD, "bot.guild-id", "").trim();
+        String channel = core.config().getString(ConfigFile.DISCORD, "account-channel-id", "").trim();
+        if (!guild.isBlank() && !channel.isBlank()) {
+            return java.util.Optional.of(
+                    "https://discord.com/channels/" + guild + "/" + channel);
+        }
+        String invite = core.config().getString(ConfigFile.DISCORD, "invite-url", "").trim();
+        return invite.isBlank() ? java.util.Optional.empty() : java.util.Optional.of(invite);
+    }
+
+    private String openLabel() {
+        return kind == Kind.TELEGRAM
+                ? "▸ Открыть Telegram и привязать автоматически"
+                : "▸ Открыть канал привязки в Discord";
+    }
+
+    /**
+     * Дублирует код в служебный канал Discord.
+     *
+     * <p><b>Код предъявительский.</b> Кто первым отправит его боту, тот и получит
+     * привязку — сам код ничьей личности не удостоверяет. Поэтому публикация в
+     * канал, доступный посторонним, равносильна передаче аккаунта тому, кто
+     * быстрее прочитал. Возможность выключена по умолчанию и включается осознанно
+     * ключом {@code discord.yml → link.post-code-to-channel} для канала, куда
+     * посторонним хода нет.
+     *
+     * <p>Сообщение уходит через ту же очередь, что и остальные: бот забирает его
+     * по своему ключу и публикует в канал из собственной конфигурации. Отдельный
+     * получатель у него отсутствует — игрок ещё не привязан, и написать ему лично
+     * невозможно, именно этим привязка и начинается.
+     */
+    private void publishToChannel(Player player, LinkService.LinkCode code) {
+        if (kind != Kind.DISCORD
+                || !core.config().getBoolean(ConfigFile.DISCORD, "link.post-code-to-channel", false)) {
+            return;
+        }
+        Instant now = Instant.now();
+        core.botOutbox().append(new BotMessage(0L, BotPlatform.DISCORD, 0L, 0L,
+                        BotMessage.Kind.LINK_CODE,
+                        Map.of("code", code.code(),
+                                "username", player.getUsername(),
+                                "ttl", humanize(code.ttl())),
+                        now, now.plus(code.ttl())))
+                .thenRun(() -> player.sendMessage(miniMessage.deserialize(
+                        "  <dark_gray>Код продублирован в канал привязки.")))
+                .exceptionally(e -> {
+                    // Не помеха: код уже показан в игре, и привязка возможна без
+                    // канала. Сообщать игроку о сбое служебной публикации незачем.
+                    logger.warn("Код привязки не опубликован в канал Discord для {}",
+                            player.getUsername(), e);
+                    return null;
+                });
+    }
+
+    /**
+     * Обезвреживает значение внутри тега MiniMessage.
+     *
+     * <p>Адрес приходит из конфигурации, а не от игрока, но апостроф в нём закрыл
+     * бы кавычку тега и превратил остаток строки в разметку.
+     */
+    private static String escapeTag(String value) {
+        return value.replace("'", "").replace("<", "").replace(">", "");
     }
 
     private void unlink(Player player, Account account) {

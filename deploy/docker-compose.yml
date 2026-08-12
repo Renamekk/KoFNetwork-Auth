@@ -63,6 +63,13 @@ x-kofauth-env: &kofauth-env
   KOFAUTH_TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
   KOFAUTH_DISCORD_ENABLED: ${DISCORD_ENABLED:-false}
   KOFAUTH_DISCORD_BOT_GUILD_ID: ${DISCORD_GUILD_ID:-}
+  # Канал привязки и приглашение нужны прокси: из них собирается кликабельная
+  # ссылка, которую /discord показывает игроку рядом с кодом.
+  KOFAUTH_DISCORD_ACCOUNT_CHANNEL_ID: ${DISCORD_ACCOUNT_CHANNEL_ID:-}
+  KOFAUTH_DISCORD_INVITE_URL: ${DISCORD_INVITE_URL:-}
+  # Дублировать ли код в канал привязки. Код предъявительский — включать только
+  # для канала, куда посторонним хода нет. Разбор — в discord.yml.
+  KOFAUTH_DISCORD_LINK_POST_CODE_TO_CHANNEL: ${DISCORD_POST_CODE_TO_CHANNEL:-false}
   # Ключ доступа ботов к /api/bot. Нужен именно webapi — он эту поверхность
   # и обслуживает. Пустое значение выключает её целиком, а не открывает.
   KOFAUTH_SECURITY_BOT_API_KEY: ${BOT_API_KEY:-}
@@ -94,6 +101,12 @@ x-bot-env: &bot-env
   # Как часто опрашивать очередь, когда она пуста.
   KOFAUTH_EVENTS_POLL_SECONDS: ${BOT_POLL_SECONDS:-2}
   KOFAUTH_PANEL_URL: ${PANEL_URL:-http://127.0.0.1:8080}
+  # Оформление: баннер в шапке меню и ссылка на донат в профиле.
+  # Всё необязательно — без них боты работают так же, просто выглядят голыми.
+  KOFAUTH_BANNER_URL: ${BANNER_URL:-}
+  KOFAUTH_BANNER_FILE: ${BANNER_FILE:-}
+  KOFAUTH_DONATE_URL: ${DONATE_URL:-}
+  KOFAUTH_SITE_URL: ${SITE_URL:-}
   KOFAUTH_LOG_LEVEL: ${LOG_LEVEL:-INFO}
   TZ: UTC
 
@@ -408,6 +421,9 @@ services:
       <<: *bot-env
       KOFAUTH_DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
       KOFAUTH_DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+      # Канал привязки: туда игрок приходит по ссылке из игры и туда же
+      # публикуется код, если это включено в discord.yml.
+      KOFAUTH_DISCORD_ACCOUNT_CHANNEL_ID: ${DISCORD_ACCOUNT_CHANNEL_ID:-}
     command: ["python", "-m", "discord_bot"]
 
   # =========================================================== HTTPS

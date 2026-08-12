@@ -35,7 +35,13 @@ import java.util.concurrent.CompletableFuture;
  * <p><b>Права проверяются по RBAC из базы, а не по правам Velocity.</b> Роли
  * KoFAuth общие для всей сети и меняются из панели; дублировать их в
  * {@code permissions.json} каждого прокси означало бы держать два источника истины,
- * которые неизбежно разойдутся. Консоль имеет все права безусловно.
+ * которые неизбежно разойдутся.
+ *
+ * <p><b>Поверх ролей стоит безусловный доступ.</b> Консоль, OP игрового сервера и
+ * перечисленные в {@code velocity.yml → admin.operators} получают все подкоманды
+ * без исключений и без разбора узлов: тот, кто может выдать себе OP, и так
+ * распоряжается сервером, и отказывать ему в просмотре чужого адреса
+ * бессмысленно. Разбор источников доступа — в {@link AdminAccess}.
  *
  * <p>Каждое действие над чужим аккаунтом пишется в аудит с указанием исполнителя:
  * по журналу должно быть видно не только что произошло, но и кто это сделал.
@@ -95,9 +101,11 @@ public final class AuthAdminCommand implements SimpleCommand {
 
             new SubCommand("player", "<ник>",
                     "сведения об аккаунте",
-                    List.of("Статус, дата регистрации, последний вход и адрес,",
-                            "геолокация, число неудачных попыток, второй фактор, CAPTCHA.",
-                            "Адреса показываются частично скрытыми."),
+                    List.of("Статус, дата регистрации, второй фактор, CAPTCHA,",
+                            "геолокация и число неудачных попыток.",
+                            "<red>Адреса показываются полностью: адрес регистрации,",
+                            "<red>первого и последнего входа. Это персональные данные —",
+                            "<red>не выводите команду на стрим и в общий чат."),
                     List.of("/auth player Steve"), true),
 
             new SubCommand("lock", "<ник>",
@@ -137,6 +145,16 @@ public final class AuthAdminCommand implements SimpleCommand {
                             "признак того, что аккаунтом пользуются не только владельцем."),
                     List.of("/auth sessions Steve"), true),
 
+            new SubCommand("logout", "<ник>",
+                    "сбросить сессии игрока",
+                    List.of("Завершает все сессии аккаунта: игровые, веб и токены.",
+                            "Игрока выбрасывает к аутентификации немедленно — он",
+                            "проходит вход заново с вводом пароля и второго фактора.",
+                            "Аккаунт при этом НЕ блокируется: войти он сможет сразу.",
+                            "Нужна, когда пароль мог утечь, а блокировать аккаунт",
+                            "не за что: /auth lock для этого слишком грубый инструмент."),
+                    List.of("/auth logout Steve"), true),
+
             new SubCommand("devices", "<ник>",
                     "устройства игрока",
                     List.of("Список известных устройств с отметками доверия и блокировки.",
@@ -175,16 +193,19 @@ public final class AuthAdminCommand implements SimpleCommand {
     private final KoFAuthCore core;
     private final ProxyServer proxy;
     private final MessageService messages;
+    private final AdminAccess access;
     private final Logger logger;
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
 
     public AuthAdminCommand(@NotNull KoFAuthCore core,
                             @NotNull ProxyServer proxy,
                             @NotNull MessageService messages,
+                            @NotNull AdminAccess access,
                             @NotNull Logger logger) {
         this.core = core;
         this.proxy = proxy;
         this.messages = messages;
+        this.access = access;
         this.logger = logger;
     }
 
@@ -213,7 +234,7 @@ public final class AuthAdminCommand implements SimpleCommand {
             return;
         }
 
-        requirePermission(source, "kofauth.admin." + permissionFor(sub)).thenAccept(allowed -> {
+        access.allows(source, "kofauth.admin." + permissionFor(sub)).thenAccept(allowed -> {
             if (!allowed) {
                 source.sendMessage(miniMessage.deserialize("<red>Недостаточно прав."));
                 return;
@@ -241,6 +262,7 @@ public final class AuthAdminCommand implements SimpleCommand {
             case "resetpassword" -> resetPassword(source, args);
             case "forceverify" -> withAccount(source, args, this::forceVerify);
             case "sessions" -> withAccount(source, args, this::showSessions);
+            case "logout" -> withAccount(source, args, this::dropSessions);
             case "devices" -> withAccount(source, args, this::showDevices);
             case "logs" -> withAccount(source, args, this::showLogs);
             case "migrate" -> migrate(source);
@@ -255,7 +277,7 @@ public final class AuthAdminCommand implements SimpleCommand {
     private void reload(CommandSource source) {
         // Заодно сбрасываем отражение прав: выданная только что роль должна
         // подхватываться перезагрузкой, а не переподключением игрока.
-        adminCache.clear();
+        access.invalidate();
         source.sendMessage(prefixed("<yellow>Перезагрузка конфигурации..."));
         core.config().reload().thenAccept(report -> {
             if (report.success()) {
@@ -283,24 +305,74 @@ public final class AuthAdminCommand implements SimpleCommand {
         line(source, "Кэш", core.cache().isAvailable()
                 ? "<green>" + core.cache().providerName()
                 : "<yellow>отключён <gray>(сессии не общие между процессами)");
+        // Подъём прав по OP работает только через общее хранилище. Молчать об
+        // этом нельзя: неработающий признак выглядит как поломка плагина.
+        line(source, "Права по OP", access.operatorsShared()
+                ? "<green>работают <gray>(признак приходит с игровых серверов)"
+                : "<yellow>не переносятся <gray>(нет общего Redis — "
+                        + "администраторов задаёт velocity.yml → admin.operators)");
         line(source, "Пул БД", "активных " + pools.databaseActive()
                 + ", в очереди " + pools.databaseQueued());
         line(source, "Пул I/O", "активных " + pools.ioActive()
                 + ", в очереди " + pools.ioQueued());
     }
 
+    /**
+     * Карточка аккаунта для администратора — <b>без маскирования адресов</b>.
+     *
+     * <p>Разбор инцидента ведётся по адресам, и {@code 192.168.0.***} для него
+     * бесполезен: по нему не сверить два входа между собой, не сопоставить
+     * с логом обратного прокси и не отличить соседа по NAT от чужого человека.
+     * Прежняя маскировка защищала не от администратора — она мешала именно ему,
+     * оставляя единственным способом узнать адрес прямой запрос к базе.
+     *
+     * <p>Показываются три адреса, и они отвечают на разные вопросы:
+     * <ul>
+     *   <li><b>регистрация</b> — откуда аккаунт создан;</li>
+     *   <li><b>первый вход</b> — откуда им начали пользоваться. При угоне сразу
+     *       после регистрации эти два расходятся, и по одному лишь адресу
+     *       регистрации подмену не увидеть;</li>
+     *   <li><b>последний вход</b> — откуда им пользуются сейчас.</li>
+     * </ul>
+     *
+     * <p>Строка первого входа читается из {@code login_history} и может быть
+     * пуста: записи чистятся по сроку хранения. Пустота означает исчерпанную
+     * ретенцию, а не отсутствие входов, и так и подписана.
+     */
     private void showPlayer(CommandSource source, Account account) {
+        // Первый вход читается ДО вывода, а не по ходу его. В аккаунте хранится
+        // только последний вход, первый лежит в login_history, и печать из
+        // колбэка развалила бы порядок карточки: строка приезжала бы после
+        // всех остальных, то есть под «CAPTCHA пройдена», а не рядом
+        // с регистрацией и последним входом, с которыми её и сравнивают.
+        core.adminOperations().firstLogin(account.id())
+                .exceptionally(e -> {
+                    logger.warn("Не удалось прочитать первый вход аккаунта {}",
+                            account.username(), e);
+                    return Optional.empty();
+                })
+                .thenAccept(first -> renderPlayer(source, account, first));
+    }
+
+    private void renderPlayer(CommandSource source,
+                              Account account,
+                              Optional<net.kofnetwork.auth.api.model.LoginAttempt> firstLogin) {
         Instant now = Instant.now();
         source.sendMessage(prefixed("<gray>─── <white>" + account.username() + " <gray>───"));
         line(source, "UUID", account.uuid().toString());
         line(source, "Статус", statusColor(account) + account.status());
         line(source, "Лицензионный", account.premium() ? "да" : "нет");
         line(source, "Регистрация", TIME.format(account.registrationDate())
-                + " <gray>с " + account.registrationIp().asMasked());
+                + " <gray>с <aqua>" + account.registrationIp().asString());
+        line(source, "Первый вход", firstLogin
+                .map(attempt -> TIME.format(attempt.createdAt())
+                        + " <gray>с <aqua>" + attempt.ip().asString()
+                        + locationOf(attempt.country(), attempt.city()))
+                .orElse("<gray>нет записей <dark_gray>(история очищена по сроку хранения)"));
         line(source, "Последний вход", account.lastLoginAt() == null
                 ? "<gray>никогда"
-                : TIME.format(account.lastLoginAt()) + " <gray>с "
-                        + (account.lastLoginIp() == null ? "?" : account.lastLoginIp().asMasked()));
+                : TIME.format(account.lastLoginAt()) + " <gray>с <aqua>"
+                        + (account.lastLoginIp() == null ? "?" : account.lastLoginIp().asString()));
         line(source, "Геолокация", account.lastCountry() == null
                 ? "<gray>неизвестна"
                 : account.lastCountry() + (account.lastCity() == null ? "" : ", " + account.lastCity()));
@@ -312,6 +384,49 @@ public final class AuthAdminCommand implements SimpleCommand {
                 ? account.twoFactorMethods().toString()
                 : "<gray>выключен");
         line(source, "CAPTCHA пройдена", account.captchaPassed() ? "да" : "нет");
+    }
+
+    /** Страна и город попытки в скобках; пусто, если геолокация неизвестна. */
+    private static String locationOf(String country, String city) {
+        if (country == null && city == null) {
+            return "";
+        }
+        String place = country == null ? city : (city == null ? country : country + ", " + city);
+        return " <dark_gray>(" + escape(place) + ")";
+    }
+
+    /**
+     * Сбрасывает все сессии игрока, не блокируя аккаунт.
+     *
+     * <p>Отзыв публикует {@link net.kofnetwork.auth.api.event.events.SessionInvalidatedEvent},
+     * а на него уже подписан прокси: игрок с отозванной сессией возвращается
+     * к аутентификации сам, без отдельного обхода списка подключённых. Поэтому
+     * здесь только отзыв и запись в аудит — выбрасывать игрока вручную значило бы
+     * продублировать путь, который и так работает для всех узлов сети, включая
+     * соседние прокси.
+     *
+     * <p>Отличие от {@code /auth lock}: там вход закрывается совсем, здесь игрок
+     * входит заново тем же паролем. Это разные инструменты для разных случаев —
+     * «возможно, утёк пароль» и «этот аккаунт больше не должен заходить».
+     */
+    private void dropSessions(CommandSource source, Account account) {
+        core.sessions().revokeAll(account.id(), null, Session.REASON_ADMIN)
+                .thenCompose(revoked -> core.audit().logAdminAction(account.id(), actorId(source),
+                                SecurityEventType.SESSION_REVOKED, contextOf(source),
+                                "Сессии сброшены администратором")
+                        .thenApply(ignored -> revoked))
+                .thenAccept(revoked -> source.sendMessage(revoked == 0
+                        ? prefixed("<yellow>У " + account.username()
+                                + " не было активных сессий. Войти заново он всё равно обязан: "
+                                + "привязка снята.")
+                        : prefixed("<green>Сессии " + account.username()
+                                + " сброшены <gray>(" + revoked + "). "
+                                + "Игрок вернётся к вводу пароля.")))
+                .exceptionally(e -> {
+                    logger.error("Не удалось сбросить сессии аккаунта {}", account.username(), e);
+                    source.sendMessage(prefixed("<red>Ошибка: " + escape(e.getMessage())));
+                    return null;
+                });
     }
 
     private void setStatus(CommandSource source, Account account, AccountStatus status) {
@@ -371,8 +486,16 @@ public final class AuthAdminCommand implements SimpleCommand {
         });
     }
 
+    /**
+     * Сессии аккаунта с полными адресами.
+     *
+     * <p>Читаются доменные сессии, а не DTO личного кабинета: в DTO адрес
+     * маскирован, потому что тот же список видит игрок на сайте. Здесь смотрит
+     * администратор, и маска ему только мешает — по {@code 192.168.0.***} не
+     * сверить две сессии между собой.
+     */
     private void showSessions(CommandSource source, Account account) {
-        core.sessions().listSessions(account.id(), null).thenAccept(sessions -> {
+        core.adminOperations().listSessions(account.id()).thenAccept(sessions -> {
             if (sessions.isEmpty()) {
                 source.sendMessage(prefixed("<gray>Активных сессий нет."));
                 return;
@@ -380,9 +503,14 @@ public final class AuthAdminCommand implements SimpleCommand {
             source.sendMessage(prefixed("<white>Сессии " + account.username()
                     + " <gray>(" + sessions.size() + ")"));
             sessions.forEach(session -> source.sendMessage(miniMessage.deserialize(
-                    "  <gray>— <white>" + session.type() + " <gray>| " + session.ipMasked()
-                            + " | " + TIME.format(session.lastSeenAt())
-                            + (session.server() == null ? "" : " | " + session.server()))));
+                    "  <gray>— <white>" + session.type() + " <gray>| <aqua>"
+                            + session.ip().asString()
+                            + " <gray>| " + TIME.format(session.lastSeenAt())
+                            + (session.server() == null ? "" : " | " + escape(session.server())))));
+        }).exceptionally(e -> {
+            logger.error("Не удалось прочитать сессии аккаунта {}", account.username(), e);
+            source.sendMessage(prefixed("<red>Ошибка: " + escape(e.getMessage())));
+            return null;
         });
     }
 
@@ -395,8 +523,8 @@ public final class AuthAdminCommand implements SimpleCommand {
             }
             devices.forEach(device -> source.sendMessage(miniMessage.deserialize(
                     "  <gray>— <white>" + escape(device.friendlyName())
-                            + " <gray>| " + device.lastSeenIp().asMasked()
-                            + " | " + TIME.format(device.lastSeenAt())
+                            + " <gray>| <aqua>" + device.lastSeenIp().asString()
+                            + " <gray>| " + TIME.format(device.lastSeenAt())
                             + (device.trusted() ? " <green>[доверено]" : "")
                             + (device.blocked() ? " <red>[заблокировано]" : ""))));
         });
@@ -519,23 +647,6 @@ public final class AuthAdminCommand implements SimpleCommand {
         });
     }
 
-    /**
-     * Проверяет право через RBAC.
-     *
-     * <p>Консоль получает всё безусловно: у неё нет аккаунта, а требовать
-     * заводить его для администратора сервера бессмысленно.
-     */
-    private CompletableFuture<Boolean> requirePermission(CommandSource source, String node) {
-        if (!(source instanceof Player player)) {
-            return CompletableFuture.completedFuture(true);
-        }
-        return core.authentication().findAccount(player.getUsername())
-                .thenCompose(account -> account
-                        .map(value -> core.adminOperations().hasPermission(value.id(), node))
-                        .orElseGet(() -> CompletableFuture.completedFuture(false)))
-                .exceptionally(e -> false);
-    }
-
     private long actorId(CommandSource source) {
         // Консоль не имеет аккаунта: в аудите исполнитель останется пустым,
         // но источник события будет SYSTEM, что и отличает её от игрока.
@@ -598,6 +709,9 @@ public final class AuthAdminCommand implements SimpleCommand {
                         + "/auth help <подкоманда></click>"));
         source.sendMessage(miniMessage.deserialize(
                 "  <dark_gray>Права выдаются ролями KoFAuth, а не permissions.json прокси."));
+        source.sendMessage(miniMessage.deserialize(access.hasFullAccessCached(source)
+                ? "  <dark_gray>У вас полный доступ: OP игрового сервера открывает все подкоманды."
+                : "  <dark_gray>OP игрового сервера открывает все подкоманды без исключений."));
     }
 
     private void helpTopic(CommandSource source, SubCommand sub) {
@@ -605,7 +719,8 @@ public final class AuthAdminCommand implements SimpleCommand {
         source.sendMessage(miniMessage.deserialize("  <gray>Назначение: <white>" + sub.summary()));
         source.sendMessage(miniMessage.deserialize("  <gray>Синтаксис: <white>/auth "
                 + sub.name() + (sub.syntax().isEmpty() ? "" : " " + escape(sub.syntax()))));
-        source.sendMessage(miniMessage.deserialize("  <gray>Право: <white>" + sub.permission()));
+        source.sendMessage(miniMessage.deserialize("  <gray>Право: <white>" + sub.permission()
+                + " <dark_gray>(или OP игрового сервера)"));
 
         source.sendMessage(miniMessage.deserialize("  <gray>Описание:"));
         sub.details().forEach(linePart ->
@@ -690,73 +805,21 @@ public final class AuthAdminCommand implements SimpleCommand {
     }
 
     /**
-     * Кому RBAC уже подтвердил или отказал в доступе к {@code /auth}.
-     *
-     * <p>Отражение права из базы. Спрашивать базу синхронно нельзя: Velocity
-     * вызывает {@link #hasPermission} в том числе на каждое нажатие TAB.
-     */
-    private final java.util.Map<java.util.UUID, Boolean> adminCache =
-            new java.util.concurrent.ConcurrentHashMap<>();
-
-    /**
      * Допускать ли источник к команде.
      *
-     * <p><b>Почему нельзя полагаться на права Velocity.</b> Прежняя версия
-     * требовала право {@code kofauth.admin} у самого прокси. Но Velocity не имеет
+     * <p><b>Почему нельзя полагаться на права Velocity.</b> Прокси не имеет
      * встроенной системы прав: без стороннего плагина
      * {@link com.velocitypowered.api.permission.PermissionSubject#hasPermission}
      * отвечает {@code UNDEFINED}, что приводится к {@code false} для любого
-     * игрока. Команда отклонялась прокси ещё до вызова {@link #execute}, поэтому
-     * роль администратора, выданная в базе, не проверялась никогда — сеть без
-     * плагина прав оставалась вообще без работающего {@code /auth}.
+     * игрока. Команда отклонялась бы ещё до вызова {@link #execute}, и ни роль
+     * KoFAuth, ни OP игрового сервера не проверялись бы никогда.
      *
-     * <p>Теперь источником истины служит RBAC, как и заявлено в описании класса.
-     * Право Velocity осталось достаточным условием — на сетях с LuckPerms им
-     * удобно выдавать доступ, не заводя роль в базе.
-     *
-     * <p>Пока ответ RBAC неизвестен, команда пропускается: точная проверка всё
-     * равно выполняется в {@link #execute} и откажет с понятным сообщением.
-     * Пропуск здесь ничего не открывает — он лишь позволяет первому вызову
-     * дойти до настоящей проверки, а не потеряться.
+     * <p>Решение принимает {@link AdminAccess}; здесь только синхронный ответ по
+     * уже известному, потому что Velocity спрашивает этот метод в том числе на
+     * каждое нажатие TAB.
      */
     @Override
     public boolean hasPermission(Invocation invocation) {
-        if (!(invocation.source() instanceof Player player)) {
-            // Консоль имеет все права безусловно: у неё нет аккаунта, и заводить
-            // его администратору сервера бессмысленно.
-            return true;
-        }
-        if (player.hasPermission("kofauth.admin")) {
-            return true;
-        }
-
-        Boolean known = adminCache.get(player.getUniqueId());
-        if (known != null) {
-            return known;
-        }
-        refreshAdminCache(player);
-        return true;
-    }
-
-    /** Спрашивает RBAC и запоминает ответ. */
-    private void refreshAdminCache(Player player) {
-        requirePermission(player, "kofauth.admin")
-                .thenAccept(allowed -> adminCache.put(player.getUniqueId(), allowed))
-                .exceptionally(e -> {
-                    logger.warn("Не удалось проверить права игрока {}",
-                            player.getUsername(), e);
-                    return null;
-                });
-    }
-
-    /**
-     * Забывает игрока при отключении.
-     *
-     * <p>Иначе карта растёт на каждого зашедшего, а выданная роль не подхватится
-     * до перезапуска прокси: вернувшийся игрок получит ответ, записанный
-     * в прошлое подключение.
-     */
-    public void forget(@NotNull java.util.UUID playerUuid) {
-        adminCache.remove(playerUuid);
+        return access.maySee(invocation.source());
     }
 }

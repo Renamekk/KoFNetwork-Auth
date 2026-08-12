@@ -41,11 +41,8 @@ class TestВторойФактор:
 
 
 class TestСписки:
-    def test_пустые_устройства_объясняются_словами(self) -> None:
-        # Пустой экран без текста читается как поломка.
-        assert texts.device_lines([]) == ["Устройств пока нет."]
-
     def test_пустая_история_объясняется_словами(self) -> None:
+        # Пустой экран без текста читается как поломка.
         assert texts.history_lines([]) == ["История пуста."]
 
     def test_неудачный_вход_помечен(self) -> None:
@@ -56,7 +53,42 @@ class TestСписки:
         assert "❌" in lines[0]
         assert "BAD_PASSWORD" in lines[0]
 
-    def test_временная_блокировка_видна_в_профиле(self) -> None:
+
+class TestПрофиль:
+    PROFILE = {
+        "username": "Steve",
+        "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "status": "ACTIVE",
+        "registeredAt": "2026-08-01T10:00:00Z",
+        "lastLoginAt": "2026-08-04T10:00:00Z",
+        "lastLoginIp": "1.2.3.***",
+        "country": "RU",
+        "city": "Москва",
+    }
+
+    def test_показывает_ник_и_даты(self) -> None:
+        lines = texts.profile_lines(self.PROFILE)
+        assert any("Steve" in line for line in lines)
+        assert any(line.startswith("Регистрация:") for line in lines)
+        assert any(line.startswith("Последний вход:") for line in lines)
+
+    def test_не_показывает_служебное_и_личное(self) -> None:
+        # UUID и статус игроку ничего не говорят, а адрес и город — данные,
+        # из-за которых экран профиля нельзя показать другу.
+        body = "\n".join(texts.profile_lines(self.PROFILE))
+        assert "550e8400" not in body
+        assert "ACTIVE" not in body
+        assert "1.2.3" not in body
+        assert "Москва" not in body
+
+    def test_донат_появляется_только_с_адресом(self) -> None:
+        assert not any(
+            "Поддержать" in line for line in texts.profile_lines(self.PROFILE)
+        )
+        with_donate = texts.profile_lines(self.PROFILE, donate_url="https://kof.net/donate")
+        assert any("https://kof.net/donate" in line for line in with_donate)
+
+    def test_временная_блокировка_видна(self) -> None:
         lines = texts.profile_lines({
             "username": "Steve", "temporarilyLocked": True,
             "lockedUntil": "2026-08-04T13:00:00Z",

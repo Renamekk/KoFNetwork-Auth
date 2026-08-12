@@ -19,6 +19,7 @@ import net.kofnetwork.auth.api.event.events.SessionInvalidatedEvent;
 import net.kofnetwork.auth.api.model.ApprovalStatus;
 import net.kofnetwork.auth.api.model.AuthState;
 import net.kofnetwork.auth.core.KoFAuthCore;
+import net.kofnetwork.auth.velocity.command.AdminAccess;
 import net.kofnetwork.auth.velocity.command.AuthAdminCommand;
 import net.kofnetwork.auth.velocity.command.EmailCommand;
 import net.kofnetwork.auth.velocity.command.LinkCommand;
@@ -79,7 +80,7 @@ public final class KoFAuthVelocity {
     private PlayerTransfer transfer;
     private LimboLifecycleController lifecycle;
     private MessageService messages;
-    private AuthAdminCommand adminCommand;
+    private AdminAccess adminAccess;
 
     private final PendingLogins pendingLogins = new PendingLogins();
 
@@ -107,6 +108,7 @@ public final class KoFAuthVelocity {
         this.pool = new ServerPool(proxy, core.config(), health, logger);
         this.transfer = new PlayerTransfer(pool, logger);
         this.messages = new MessageService(core.config());
+        this.adminAccess = new AdminAccess(core, logger);
 
         LimboControlPlane controlPlane =
                 HttpLimboControlPlane.fromConfig(core.config(), pool.limboNames(), logger);
@@ -185,8 +187,7 @@ public final class KoFAuthVelocity {
                 .aliases("kofauth")
                 .plugin(this)
                 .build();
-        this.adminCommand = new AuthAdminCommand(core, proxy, messages, logger);
-        commands.register(auth, adminCommand);
+        commands.register(auth, new AuthAdminCommand(core, proxy, messages, adminAccess, logger));
 
         CommandMeta email = commands.metaBuilder("email")
                 .aliases("почта")
@@ -445,6 +446,7 @@ public final class KoFAuthVelocity {
                     }
                     player.sendMessage(messages.prefixed("login-success",
                             "<green>Вход подтверждён. Приятной игры!"));
+                    messages.welcomeTitle(player.getUsername()).ifPresent(player::showTitle);
                     sendToHub(player);
                 });
     }
@@ -638,8 +640,8 @@ public final class KoFAuthVelocity {
     public void onDisconnect(DisconnectEvent event) {
         UUID uuid = event.getPlayer().getUniqueId();
         pendingLogins.disconnected(uuid);
-        if (adminCommand != null) {
-            adminCommand.forget(uuid);
+        if (adminAccess != null) {
+            adminAccess.forget(uuid);
         }
     }
 

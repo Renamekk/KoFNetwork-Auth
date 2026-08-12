@@ -24,7 +24,7 @@ from kofauth_common import (
 )
 from kofauth_common import events as event_kinds
 
-from .views import PLATFORM, ApprovalView, MenuView, embed
+from .views import PLATFORM, ApprovalView, Brand, MenuView, embed, home_embed
 
 LOGGER = logging.getLogger(__name__)
 
@@ -38,6 +38,11 @@ class DiscordBot(discord.Client):
         super().__init__(intents=discord.Intents.none())
         self._settings = settings
         self._api = api
+        self._brand = Brand(
+            panel_url=settings.panel_url,
+            banner_url=settings.brand.banner_url,
+            donate_url=settings.brand.donate_url,
+        )
         self.tree = app_commands.CommandTree(self)
         self._register()
 
@@ -66,21 +71,15 @@ class DiscordBot(discord.Client):
     def _register(self) -> None:
         tree = self.tree
         api = self._api
-        panel_url = self._settings.panel_url
+        brand = self._brand
 
-        @tree.command(name="menu", description="Меню KoF Network")
+        @tree.command(name="menu", description=f"Меню {texts.BRAND}")
         async def menu_command(interaction: discord.Interaction) -> None:
             result = await _safe(interaction, api.account(PLATFORM, interaction.user.id))
             linked = result is not None and result.ok
-            lines = (
-                [f"Аккаунт: **{result.data.get('username', '—')}**", "", "Выберите раздел."]
-                if linked
-                else ["Аккаунт не привязан.", "",
-                      "Возьмите код в игре командой `/discord` и пришлите `/link КОД`."]
-            )
             await interaction.response.send_message(
-                embed=embed("KoF Network", lines),
-                view=MenuView(api, interaction.user.id, linked, panel_url),
+                embed=home_embed(result.data.get("username") if linked else None, brand),
+                view=MenuView(api, interaction.user.id, linked, brand),
                 ephemeral=True,
             )
 
@@ -92,43 +91,41 @@ class DiscordBot(discord.Client):
                 return
             if not result.ok:
                 await interaction.response.send_message(
-                    texts.describe_error(result.error), ephemeral=True
+                    f"{texts.ICON['deny']} {texts.describe_error(result.error)}",
+                    ephemeral=True,
                 )
                 return
             await interaction.response.send_message(
-                embed=embed("Аккаунт привязан",
-                            [f"Ник: **{result.data.get('username', '')}**"]),
-                view=MenuView(api, interaction.user.id, True, panel_url),
+                embed=embed(f"{texts.ICON['approve']} Аккаунт привязан",
+                            [f"Ник: **{result.data.get('username', '')}**",
+                             "",
+                             "Теперь подтверждение входа приходит сюда кнопками."]),
+                view=MenuView(api, interaction.user.id, True, brand),
                 ephemeral=True,
             )
 
         @tree.command(name="profile", description="Сведения об аккаунте")
         async def profile_command(interaction: discord.Interaction) -> None:
-            await _screen(interaction, api, "Профиль",
+            await _screen(interaction, api, f"{texts.ICON['profile']} Профиль",
                           api.account(PLATFORM, interaction.user.id),
-                          lambda data: texts.profile_lines(data))
+                          lambda data: texts.profile_lines(
+                              data, donate_url=brand.donate_url))
 
         @tree.command(name="security", description="Защита аккаунта")
         async def security_command(interaction: discord.Interaction) -> None:
-            await _screen(interaction, api, "Защита аккаунта",
+            await _screen(interaction, api, f"{texts.ICON['security']} Защита аккаунта",
                           api.account(PLATFORM, interaction.user.id),
                           lambda data: texts.security_lines(data))
 
-        @tree.command(name="devices", description="Устройства")
-        async def devices_command(interaction: discord.Interaction) -> None:
-            await _screen(interaction, api, "Устройства",
-                          api.devices(PLATFORM, interaction.user.id),
-                          lambda data: texts.device_lines(data.get("devices", [])))
-
         @tree.command(name="history", description="История входов")
         async def history_command(interaction: discord.Interaction) -> None:
-            await _screen(interaction, api, "Последние входы",
+            await _screen(interaction, api, f"{texts.ICON['history']} Последние входы",
                           api.history(PLATFORM, interaction.user.id),
                           lambda data: texts.history_lines(data.get("history", [])))
 
         @tree.command(name="sessions", description="Активные сессии")
         async def sessions_command(interaction: discord.Interaction) -> None:
-            await _screen(interaction, api, "Активные сессии",
+            await _screen(interaction, api, f"{texts.ICON['sessions']} Активные сессии",
                           api.sessions(PLATFORM, interaction.user.id),
                           lambda data: texts.session_lines(data.get("sessions", [])))
 
@@ -138,7 +135,8 @@ class DiscordBot(discord.Client):
             if result is None:
                 return
             await interaction.response.send_message(
-                "Аккаунт отвязан." if result.ok else texts.describe_error(result.error),
+                f"{texts.ICON['unlink']} Аккаунт отвязан." if result.ok
+                else texts.describe_error(result.error),
                 ephemeral=True,
             )
 
@@ -167,7 +165,8 @@ class DiscordBot(discord.Client):
         )
         try:
             await user.send(
-                embed=embed("🔐 " + lines[0], lines[1:], colour=0xFFB020),
+                embed=embed(f"{texts.ICON['lock']} " + lines[0], lines[1:],
+                            colour=texts.ATTENTION_COLOUR),
                 view=ApprovalView(self._api, message.get("approvalId"), recipient),
             )
         except discord.HTTPException as exc:
@@ -185,6 +184,45 @@ class DiscordBot(discord.Client):
             await user.send(embed=embed(title, lines))
         except discord.HTTPException as exc:
             LOGGER.info("Уведомление для %s не доставлено: %s", discord_id, exc)
+
+    async def post_link_code(self, message: BotMessage) -> None:
+        """Публикует выданный в игре код в канале привязки.
+
+        Личного получателя у сообщения нет и быть не может: игрок ещё не
+        привязан, и написать ему в личные сообщения невозможно — именно этим
+        привязка и начинается. Поэтому канал берётся из конфигурации бота.
+
+        Не задан канал — сообщение просто пропускается. Это не сбой: сервер мог
+        включить публикацию, не указав, куда публиковать, и падать на этом
+        незачем — код игрок и так видит в игре.
+        """
+        channel_id = self._settings.discord.account_channel_id_int
+        if channel_id is None:
+            LOGGER.warning(
+                "Код привязки получен, но KOFAUTH_DISCORD_ACCOUNT_CHANNEL_ID не задан"
+            )
+            return
+
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(channel_id)
+            except discord.HTTPException as exc:
+                LOGGER.warning("Канал привязки %s недоступен: %s", channel_id, exc)
+                return
+
+        lines = texts.link_code_lines(
+            message.get("username", "—"), message.get("code", "—"), message.get("ttl", "")
+        )
+        try:
+            await channel.send(
+                embed=embed(f"{texts.ICON['link']} Код привязки", lines,
+                            colour=texts.ATTENTION_COLOUR)
+            )
+        except discord.HTTPException as exc:
+            # Прав писать в канал может не быть. Игроку это ничем не грозит:
+            # код показан в игре, и привязка работает без канала.
+            LOGGER.warning("Код привязки не опубликован в %s: %s", channel_id, exc)
 
     async def _resolve(self, discord_id: int) -> discord.User | None:
         try:
@@ -256,10 +294,16 @@ def register_message_handlers(bot: DiscordBot, listener: OutboxListener) -> None
             )
         ])
 
+    async def on_link_code(message: BotMessage) -> None:
+        if not message.get("code"):
+            return
+        await bot.post_link_code(message)
+
     listener.on(event_kinds.LOGIN_APPROVAL, on_approval)
     listener.on(event_kinds.LOGIN_APPROVAL_RESOLVED, on_resolved)
     listener.on(event_kinds.LOGIN_NOTICE, on_notice)
     listener.on(event_kinds.SECURITY_NOTICE, on_notice)
+    listener.on(event_kinds.LINK_CODE, on_link_code)
 
 
 NOTICES = {

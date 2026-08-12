@@ -148,6 +148,17 @@ public final class JdbcLoginHistoryRepository implements LoginHistoryRepository 
     }
 
     @Override
+    public @NotNull CompletableFuture<Optional<LoginAttempt>> findFirstSuccessful(long accountId) {
+        // Прямой проход по тому же idx_login_history_account_time, что и у
+        // findLastSuccessful, только с начала: сортировать нечего.
+        return sql.queryOne("""
+                        SELECT %s FROM login_history WHERE account_id = ? AND success = 1
+                        ORDER BY created_at ASC LIMIT 1
+                        """.formatted(COLUMNS),
+                JdbcLoginHistoryRepository::map, accountId);
+    }
+
+    @Override
     public @NotNull CompletableFuture<Integer> deleteBefore(@NotNull Instant before) {
         return sql.update("DELETE FROM login_history WHERE created_at < ?",
                 SqlTypes.toTimestamp(before));
