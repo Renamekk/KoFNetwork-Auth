@@ -125,7 +125,77 @@ public final class JdbcSecurityLogRepository implements SecurityLogRepository {
         for (SecurityLogEntry entry : entries) {
             batch.add(toParams(entry));
         }
-        return sql.batch(INSERT_SQL, batch).thenApply(ignored -> null);
+        return sql.batchAtomic(INSERT_SQL, batch)
+                .<Void>thenApply(ignored -> null)
+                .exceptionallyCompose(failure -> salvage(entries, failure));
+    }
+
+    /**
+     * Спасает пакет, отвергнутый из-за одной строки.
+     *
+     * <p><b>Зачем.</b> Пакет — это один запрос к серверу, и отвергается он целиком.
+     * Одна негодная строка — например, с {@code actor_id}, которому не нашлось
+     * аккаунта, — уносила с собой до полусотни исправных записей о совершенно
+     * других событиях: входах, сменах пароля, отзывах сессий. Журнал безопасности,
+     * теряющий соседние записи из-за одной испорченной, перестаёт быть журналом.
+     *
+     * <p>Поэтому отказ по ограничению целостности разбирается построчно: каждая
+     * запись отправляется отдельно, негодная называется в логе поимённо и
+     * пропускается, все остальные доходят до базы. Пакет к этому моменту откатан
+     * целиком ({@link SqlExecutor#batchAtomic}), поэтому повтор ничего не дублирует.
+     *
+     * <p>Недоступность базы разбирать построчно бессмысленно и вредно: полсотни
+     * запросов подряд, каждый со своим ожиданием соединения, — это минуты в потоке
+     * сброса буфера. Такой отказ пробрасывается вызывающему как есть.
+     */
+    private CompletableFuture<Void> salvage(List<SecurityLogEntry> entries, Throwable batchFailure) {
+        if (!isConstraintViolation(batchFailure)) {
+            return CompletableFuture.failedFuture(batchFailure);
+        }
+        LOGGER.warn("Пакет аудита из {} записей отвергнут базой, повторяю построчно: {}",
+                entries.size(), rootMessage(batchFailure));
+
+        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
+        for (SecurityLogEntry entry : entries) {
+            chain = chain.thenCompose(ignored -> insertOrSkip(entry));
+        }
+        return chain;
+    }
+
+    /** Отдельная запись: негодная пропускается, отказ хранилища прекращает разбор. */
+    private CompletableFuture<Void> insertOrSkip(SecurityLogEntry entry) {
+        return sql.update(INSERT_SQL, toParams(entry))
+                .<Void>thenApply(ignored -> null)
+                .exceptionallyCompose(failure -> {
+                    if (!isConstraintViolation(failure)) {
+                        return CompletableFuture.failedFuture(failure);
+                    }
+                    LOGGER.error("Запись аудита {} (аккаунт {}, исполнитель {}) отвергнута "
+                                    + "базой и потеряна: {}",
+                            entry.eventType(), entry.accountId(), entry.actorId(),
+                            rootMessage(failure));
+                    return CompletableFuture.completedFuture(null);
+                });
+    }
+
+    /** Нарушение целостности относится к строке, а не к доступности хранилища. */
+    private static boolean isConstraintViolation(@Nullable Throwable failure) {
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof SqlExecutor.DuplicateKeyException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private static String rootMessage(Throwable failure) {
+        Throwable current = failure;
+        while (current.getCause() != null) {
+            current = current.getCause();
+        }
+        return String.valueOf(current.getMessage());
     }
 
     @Override

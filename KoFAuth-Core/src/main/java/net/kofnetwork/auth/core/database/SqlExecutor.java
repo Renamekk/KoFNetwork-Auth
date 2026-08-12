@@ -169,6 +169,38 @@ public final class SqlExecutor {
         }, sql));
     }
 
+    /**
+     * Пакетная вставка «всё или ничего».
+     *
+     * <p>Отличие от {@link #batch(String, List)} — транзакция вокруг пакета.
+     * Нужна там, где вызывающий собирается повторить отвергнутый пакет построчно:
+     * без транзакции судьба уже отправленных строк зависит от того, разбил ли
+     * драйвер пакет на несколько запросов по {@code max_allowed_packet}, и
+     * повтор в этом случае продублировал бы часть строк. Здесь отказ означает,
+     * что не записано ничего, и повторять можно смело.
+     *
+     * @return суммарное число затронутых строк
+     */
+    public @NotNull CompletableFuture<Integer> batchAtomic(@NotNull String sql,
+                                                            @NotNull List<Object[]> batch) {
+        if (batch.isEmpty()) {
+            return CompletableFuture.completedFuture(0);
+        }
+        return transaction(connection -> {
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                for (Object[] params : batch) {
+                    bind(statement, params);
+                    statement.addBatch();
+                }
+                int total = 0;
+                for (int affected : statement.executeBatch()) {
+                    total += affected > 0 ? affected : 0;
+                }
+                return total;
+            }
+        });
+    }
+
     // ------------------------------------------------------------------ транзакции
 
     /**

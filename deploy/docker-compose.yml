@@ -107,6 +107,20 @@ x-bot-env: &bot-env
   KOFAUTH_BANNER_FILE: ${BANNER_FILE:-}
   KOFAUTH_DONATE_URL: ${DONATE_URL:-}
   KOFAUTH_SITE_URL: ${SITE_URL:-}
+  # Фирменные emoji на кнопках: «ключ=<:имя:id>» для Discord и «ключ=id» для
+  # Telegram, через запятую. Идентификаторы выдают сами платформы, поэтому по
+  # умолчанию тут пусто — без них показываются обычные значки.
+  KOFAUTH_EMOJI_DISCORD: ${EMOJI_DISCORD:-}
+  KOFAUTH_EMOJI_TELEGRAM: ${EMOJI_TELEGRAM:-}
+  # Графические экраны: профиль, защита, история и сессии показываются
+  # картинкой с настоящими данными, главное меню и справка — заранее
+  # подготовленными. Шрифты и шаблоны лежат внутри образа, скачивать и
+  # монтировать нечего. Выключатель здесь на случай слабой машины: с ним боты
+  # показывают те же экраны текстом.
+  KOFAUTH_CARDS_ENABLED: ${CARDS_ENABLED:-true}
+  KOFAUTH_CARDS_QUALITY: ${CARDS_QUALITY:-84}
+  KOFAUTH_CARDS_WORKERS: ${CARDS_WORKERS:-2}
+  KOFAUTH_CARDS_CACHE_MB: ${CARDS_CACHE_MB:-24}
   KOFAUTH_LOG_LEVEL: ${LOG_LEVEL:-INFO}
   TZ: UTC
 
@@ -210,6 +224,18 @@ services:
       # и обойдёт ограничение скорости, привязку сессии к IP и баны.
       KOFAUTH_VELOCITY_FORWARDING_TRUST_PROXY_HEADER: ${TRUST_PROXY_HEADER:-false}
       KOFAUTH_VELOCITY_FORWARDING_HEADER_NAME: X-Forwarded-For
+      # Кому верить на слово про адрес клиента. Без этой строки перечень брался
+      # из velocity.yml, где стоит только петля, — а Caddy стучится в webapi с
+      # адреса контейнерной сети (172.x). Заголовок игнорировался, и весь сайт
+      # выглядел одним клиентом с адресом Caddy: 120 запросов в минуту на всех
+      # сразу, десять входов в минуту на всю сеть, привязка сессии к IP и баны
+      # по адресу — все на одном и том же адресе.
+      #
+      # Диапазоны частные: заголовок принимается, только если само соединение
+      # пришло из локальной сети, а подделать адрес сокета клиент не может.
+      # Вместе с профилем web install.sh ставит WEBAPI_BIND=127.0.0.1, поэтому
+      # снаружи до webapi в обход Caddy не достучаться вовсе.
+      KOFAUTH_VELOCITY_FORWARDING_TRUSTED_PROXIES: "${TRUSTED_PROXIES:-127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7}"
       KOFAUTH_DISCORD_OAUTH_ENABLED: ${DISCORD_OAUTH_ENABLED:-false}
       KOFAUTH_DISCORD_OAUTH_CLIENT_ID: ${DISCORD_OAUTH_CLIENT_ID:-}
       KOFAUTH_DISCORD_OAUTH_CLIENT_SECRET: ${DISCORD_OAUTH_CLIENT_SECRET:-}

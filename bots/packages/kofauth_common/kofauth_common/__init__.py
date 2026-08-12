@@ -6,6 +6,7 @@
 """
 
 from .api import ApiResult, ApiUnavailable, KoFAuthApi
+from .cards import Card, CardService, CardSettings
 from .config import BrandSettings, ConfigurationError, OutboxSettings, Settings
 from .events import (
     LINK_CODE,
@@ -16,13 +17,18 @@ from .events import (
     BotMessage,
     OutboxListener,
 )
+from .glyphs import EmojiSet, strip_custom_emoji
 
 __all__ = [
     "ApiResult",
     "ApiUnavailable",
     "BotMessage",
     "BrandSettings",
+    "Card",
+    "CardService",
+    "CardSettings",
     "ConfigurationError",
+    "EmojiSet",
     "LINK_CODE",
     "LOGIN_APPROVAL",
     "LOGIN_APPROVAL_RESOLVED",
@@ -32,4 +38,5 @@ __all__ = [
     "KoFAuthApi",
     "SECURITY_NOTICE",
     "Settings",
+    "strip_custom_emoji",
 ]

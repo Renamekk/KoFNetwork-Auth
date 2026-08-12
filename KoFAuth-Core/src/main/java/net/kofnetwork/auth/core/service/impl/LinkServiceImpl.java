@@ -502,6 +502,30 @@ public final class LinkServiceImpl implements LinkService {
         });
     }
 
+    @Override
+    public @NotNull CompletableFuture<OperationResult<Void>> setTelegramNotifications(
+            long accountId, boolean enabled) {
+        return telegram.findByAccount(accountId).thenCompose(found -> {
+            if (found.isEmpty()) {
+                return completed(OperationResult.<Void>fail("NOT_LINKED", "Telegram не привязан"));
+            }
+            return telegram.update(found.get().withNotifications(enabled))
+                    .thenApply(ignored -> OperationResult.<Void>ok());
+        });
+    }
+
+    @Override
+    public @NotNull CompletableFuture<OperationResult<Void>> setDiscordNotifications(
+            long accountId, boolean enabled) {
+        return discord.findByAccount(accountId).thenCompose(found -> {
+            if (found.isEmpty()) {
+                return completed(OperationResult.<Void>fail("NOT_LINKED", "Discord не привязан"));
+            }
+            return discord.update(found.get().withNotifications(enabled))
+                    .thenApply(ignored -> OperationResult.<Void>ok());
+        });
+    }
+
     private CompletableFuture<Void> toggleTwoFactor(long accountId,
                                                     TwoFactorMethod method,
                                                     boolean enabled) {

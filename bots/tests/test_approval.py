@@ -119,13 +119,18 @@ class TestТекстыИсходов:
 
 class TestКнопки:
     def test_в_telegram_ровно_две_кнопки_без_кодов(self) -> None:
+        from kofauth_common.glyphs import FALLBACK
         from telegram_bot import menu
 
         markup = menu.approval_keyboard("запрос-1")
         buttons = [button for row in markup.inline_keyboard for button in row]
 
         assert len(buttons) == 2
-        assert [button.text for button in buttons] == ["✅ Войти", "❌ Отклонить"]
+        # Значок проверяется по общему набору, а не по символу: оформление
+        # меняется, а число действий и их смысл — нет.
+        assert [button.text for button in buttons] == [
+            f"{FALLBACK['approve']} Войти", f"{FALLBACK['deny']} Отклонить",
+        ]
         assert {button.callback_data for button in buttons} == {
             "ok:запрос-1", "no:запрос-1",
         }

@@ -162,7 +162,7 @@ public final class LoginApprovalServiceImpl implements LoginApprovalService {
                     // Прежние кнопки того же аккаунта обесцениваются: несколько
                     // действующих запросов расширяют окно, в котором вход подтверждается.
                     .thenCompose(saved -> approvals
-                            .supersedePending(account.id(), saved.publicId(), now)
+                            .supersedePending(account.id(), saved.id(), now)
                             .thenApply(ignored -> saved))
                     .thenCompose(saved -> enqueueRequest(saved).thenApply(ignored -> saved))
                     .thenCompose(saved -> audit.log(account.id(),

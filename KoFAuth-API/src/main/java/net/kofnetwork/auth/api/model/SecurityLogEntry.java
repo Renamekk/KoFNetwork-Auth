@@ -57,13 +57,30 @@ public record SecurityLogEntry(
                 source, ip, null, null, null, message, Map.of(), Instant.now());
     }
 
-    /** Запись о действии администратора над чужим аккаунтом. */
+    /**
+     * Запись о действии администратора над чужим аккаунтом.
+     *
+     * <p><b>Исполнитель без аккаунта записывается как отсутствующий.</b> Консоль
+     * прокси — полноправный администратор, но строки в {@code users} у неё нет, и
+     * вызывающие обозначают её нулём. Ноль — не идентификатор: колонка
+     * {@code actor_id} ссылается на {@code users.id}, и вставка нуля отвергалась
+     * внешним ключом {@code fk_security_logs_actor}. Поскольку записи уходят
+     * пачкой, вместе с ней терялись и все соседние события — до полусотни строк
+     * аудита за одно действие администратора из консоли.
+     *
+     * <p>Ноль и любое неположительное значение означают здесь ровно то, что и
+     * означали, — «исполнитель неизвестен», — и попадают в колонку как
+     * {@code NULL}, который она допускает. Отличить действие консоли от действия
+     * владельца по-прежнему можно: у первого {@link #source()} равен
+     * {@code SYSTEM}, у второго — источнику его собственного входа.
+     */
     public static @NotNull SecurityLogEntry byAdmin(long targetAccountId,
                                                     long adminAccountId,
                                                     @NotNull SecurityEventType type,
                                                     @NotNull EventSource source,
                                                     @Nullable String message) {
-        return new SecurityLogEntry(0L, targetAccountId, adminAccountId, type.name(),
+        return new SecurityLogEntry(0L, targetAccountId,
+                adminAccountId > 0 ? adminAccountId : null, type.name(),
                 type.defaultSeverity(), source, null, null, null, null, message,
                 Map.of(), Instant.now());
     }

@@ -91,6 +91,8 @@ class JdbcRepositoriesIT {
     static JdbcRoleRepository roles;
     static JdbcSettingsRepository settings;
     static JdbcServerRepository servers;
+    static JdbcBotOutboxRepository outbox;
+    static JdbcLoginApprovalRepository approvals;
 
     @BeforeAll
     static void startAll(@org.junit.jupiter.api.io.TempDir Path configDir) throws IOException {
@@ -130,6 +132,8 @@ class JdbcRepositoriesIT {
         roles = new JdbcRoleRepository(sql);
         settings = new JdbcSettingsRepository(sql);
         servers = new JdbcServerRepository(sql);
+        outbox = new JdbcBotOutboxRepository(sql);
+        approvals = new JdbcLoginApprovalRepository(sql);
     }
 
     @AfterAll
@@ -150,6 +154,8 @@ class JdbcRepositoriesIT {
             statement.executeUpdate("DELETE FROM users");
             statement.executeUpdate("DELETE FROM servers");
             statement.executeUpdate("DELETE FROM captcha");
+            // Очередь ботов на аккаунт не ссылается, поэтому каскадом не чистится.
+            statement.executeUpdate("DELETE FROM bot_outbox");
         }
     }
 
@@ -846,5 +852,173 @@ class JdbcRepositoriesIT {
         // Аудит переживает удаление аккаунта: иначе исчезли бы следы инцидента.
         assertThat(audit.findByEventType(SecurityEventType.BRUTE_FORCE_DETECTED.name(),
                 Instant.now().minusSeconds(60), 10).join()).isNotEmpty();
+    }
+
+    // ================================================================ целостность аудита
+
+    /**
+     * Действие администратора из консоли.
+     *
+     * <p>Ровно тот запрос, который отвергался внешним ключом
+     * {@code fk_security_logs_actor}: исполнитель обозначен нулём, потому что у
+     * консоли аккаунта нет. Ноль обязан превратиться в {@code NULL}, а запись —
+     * дойти до базы.
+     */
+    @Test
+    void действие_из_консоли_записывается_без_исполнителя() {
+        long accountId = persist("Steve");
+
+        audit.insert(SecurityLogEntry.byAdmin(accountId, 0L,
+                SecurityEventType.ACCOUNT_LOCKED, EventSource.SYSTEM, "из консоли")).join();
+
+        assertThat(audit.findByAccount(accountId, 10, 0).join()).singleElement()
+                .satisfies(entry -> {
+                    assertThat(entry.actorId()).isNull();
+                    assertThat(entry.message()).isEqualTo("из консоли");
+                });
+    }
+
+    /**
+     * Пакет с одной негодной строкой.
+     *
+     * <p>Пакет — один запрос, и база отвергает его целиком. Раньше это означало,
+     * что одна строка с несуществующим исполнителем уносила с собой все соседние
+     * записи пачки — события, к действию администратора отношения не имевшие.
+     * Здесь негодная строка теряется одна, а остальные доходят.
+     */
+    @Test
+    void негодная_строка_не_уносит_остальной_пакет_аудита() {
+        long accountId = persist("Steve");
+        long missingActor = accountId + 100_000L;
+
+        audit.insertBatch(List.of(
+                SecurityLogEntry.of(accountId, SecurityEventType.LOGIN_SUCCESS,
+                        EventSource.MINECRAFT, IpAddress.of("203.0.113.7"), "до"),
+                SecurityLogEntry.byAdmin(accountId, missingActor,
+                        SecurityEventType.ACCOUNT_LOCKED, EventSource.SYSTEM, "негодная"),
+                SecurityLogEntry.of(accountId, SecurityEventType.BRUTE_FORCE_DETECTED,
+                        EventSource.MINECRAFT, IpAddress.of("203.0.113.7"), "после"))).join();
+
+        assertThat(audit.findByAccount(accountId, 10, 0).join())
+                .extracting(SecurityLogEntry::message)
+                .containsExactlyInAnyOrder("до", "после");
+    }
+
+    /** Успешный пакет по-прежнему уходит одним запросом и ничего не теряет. */
+    @Test
+    void исправный_пакет_аудита_записывается_целиком() {
+        long accountId = persist("Steve");
+
+        audit.insertBatch(IntStream.range(0, 25)
+                .mapToObj(i -> SecurityLogEntry.of(accountId, SecurityEventType.LOGIN_SUCCESS,
+                        EventSource.MINECRAFT, IpAddress.of("203.0.113.7"), "вход " + i))
+                .toList()).join();
+
+        assertThat(audit.findByAccount(accountId, 100, 0).join()).hasSize(25);
+    }
+
+    // ================================================================ очередь ботов
+
+    /**
+     * Код привязки в служебном канале.
+     *
+     * <p>Вид сообщения {@code LINK_CODE} существует в коде с появления команды
+     * {@code /discord}, но в перечислении колонки его не было: вставка отвергалась,
+     * и публикация кода не работала ни разу. Проверяется именно запись и чтение
+     * обратно — миграция V4 добавляет значение в конец списка.
+     */
+    @Test
+    void очередь_ботов_принимает_код_привязки() {
+        Instant now = Instant.now();
+
+        outbox.append(new net.kofnetwork.auth.api.model.BotMessage(0L,
+                net.kofnetwork.auth.api.model.BotPlatform.DISCORD, 0L, 0L,
+                net.kofnetwork.auth.api.model.BotMessage.Kind.LINK_CODE,
+                java.util.Map.of("code", "ABCD1234", "username", "Steve", "ttl", "10 мин"),
+                now, now.plusSeconds(600))).join();
+
+        assertThat(outbox.readAfter(net.kofnetwork.auth.api.model.BotPlatform.DISCORD,
+                        0L, 10, now).join())
+                .singleElement()
+                .satisfies(message -> {
+                    assertThat(message.kind())
+                            .isEqualTo(net.kofnetwork.auth.api.model.BotMessage.Kind.LINK_CODE);
+                    assertThat(message.get("code")).isEqualTo("ABCD1234");
+                });
+    }
+
+    /** Все виды сообщений обязаны проходить в колонку: перечисления должны совпадать. */
+    @Test
+    void очередь_ботов_принимает_все_виды_сообщений() {
+        Instant now = Instant.now();
+        for (net.kofnetwork.auth.api.model.BotMessage.Kind kind
+                : net.kofnetwork.auth.api.model.BotMessage.Kind.values()) {
+            outbox.append(new net.kofnetwork.auth.api.model.BotMessage(0L,
+                    net.kofnetwork.auth.api.model.BotPlatform.TELEGRAM, 1L, 1L, kind,
+                    java.util.Map.of(), now, now.plusSeconds(600))).join();
+        }
+
+        assertThat(outbox.readAfter(net.kofnetwork.auth.api.model.BotPlatform.TELEGRAM,
+                        0L, 50, now).join())
+                .extracting(net.kofnetwork.auth.api.model.BotMessage::kind)
+                .containsExactlyInAnyOrder(net.kofnetwork.auth.api.model.BotMessage.Kind.values());
+    }
+
+    /** История входов обязана принимать все источники, включая системный. */
+    @Test
+    void история_входов_принимает_системный_источник() {
+        long accountId = persist("Steve");
+
+        history.insert(LoginAttempt.failure(accountId, "Steve", LoginResultType.ERROR,
+                IpAddress.of("203.0.113.7"), EventSource.SYSTEM)).join();
+
+        assertThat(history.findByAccount(accountId, 10, 0).join()).singleElement()
+                .satisfies(attempt -> assertThat(attempt.source()).isEqualTo(EventSource.SYSTEM));
+    }
+
+    // ================================================================ подтверждения входа
+
+    /**
+     * Две одновременные попытки одного аккаунта.
+     *
+     * <p>Прежнее условие «погасить всё, кроме моей» было симметричным: каждая из
+     * двух попыток объявляла устаревшей другую, и живой не оставалось ни одной —
+     * игрок получал две мёртвые кнопки и не мог войти ни одним способом. Граница
+     * по номеру записи задаёт одинаковый для обоих запросов порядок: выживает
+     * последняя записанная.
+     */
+    @Test
+    void из_двух_одновременных_подтверждений_выживает_последнее() {
+        long accountId = persist("Steve");
+        Instant now = Instant.now();
+
+        net.kofnetwork.auth.api.model.LoginApproval first =
+                approvals.insert(approval(accountId, "first", "attempt-1", now)).join();
+        net.kofnetwork.auth.api.model.LoginApproval second =
+                approvals.insert(approval(accountId, "second", "attempt-2", now)).join();
+
+        // Обе попытки гасят «всё, что старше себя» — в любом порядке.
+        approvals.supersedePending(accountId, first.id(), now).join();
+        approvals.supersedePending(accountId, second.id(), now).join();
+
+        assertThat(approvals.findByPublicId("first").join()).get()
+                .extracting(net.kofnetwork.auth.api.model.LoginApproval::status)
+                .isEqualTo(net.kofnetwork.auth.api.model.ApprovalStatus.EXPIRED);
+        assertThat(approvals.findByPublicId("second").join()).get()
+                .extracting(net.kofnetwork.auth.api.model.LoginApproval::status)
+                .as("последняя попытка обязана остаться живой")
+                .isEqualTo(net.kofnetwork.auth.api.model.ApprovalStatus.PENDING);
+    }
+
+    private static net.kofnetwork.auth.api.model.LoginApproval approval(long accountId,
+                                                                        String publicId,
+                                                                        String attemptId,
+                                                                        Instant now) {
+        return new net.kofnetwork.auth.api.model.LoginApproval(0L, publicId, accountId, "Steve",
+                UUID.randomUUID(), attemptId, EventSource.MINECRAFT, DevicePlatform.MINECRAFT,
+                null, null, net.kofnetwork.auth.api.model.BotPlatform.TELEGRAM, 100L, 100L,
+                IpAddress.of("203.0.113.7"), null, null, null,
+                net.kofnetwork.auth.api.model.ApprovalStatus.PENDING,
+                now, now.plusSeconds(120), null, null, null, null, null);
     }
 }

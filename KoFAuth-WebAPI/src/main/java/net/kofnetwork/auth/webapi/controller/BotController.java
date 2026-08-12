@@ -349,6 +349,21 @@ public class BotController {
                                     result.errorCode(), result.errorMessage()));
                         }
                     }
+                    // Поле уведомлений принималось и молча выбрасывалось: бот получал
+                    // 200 и профиль с прежним значением, то есть выключение уведомлений
+                    // выглядело выполненным и не выполнялось. Настройка не косметическая —
+                    // ею владелец решает, узнает ли он о чужом входе.
+                    if (body.notifications() != null) {
+                        var result = platform == Platform.TELEGRAM
+                                ? core.links().setTelegramNotifications(
+                                        account.id(), body.notifications()).join()
+                                : core.links().setDiscordNotifications(
+                                        account.id(), body.notifications()).join();
+                        if (!result.isSuccess()) {
+                            return ResponseEntity.badRequest().body(ApiDtos.ErrorResponse.of(
+                                    result.errorCode(), result.errorMessage()));
+                        }
+                    }
                     return ResponseEntity.ok(profileOf(platform, account));
                 });
     }

@@ -411,9 +411,10 @@ public final class AuthAdminCommand implements SimpleCommand {
      */
     private void dropSessions(CommandSource source, Account account) {
         core.sessions().revokeAll(account.id(), null, Session.REASON_ADMIN)
-                .thenCompose(revoked -> core.audit().logAdminAction(account.id(), actorId(source),
+                .thenCompose(revoked -> actorId(source)
+                        .thenCompose(actor -> core.audit().logAdminAction(account.id(), actor,
                                 SecurityEventType.SESSION_REVOKED, contextOf(source),
-                                "Сессии сброшены администратором")
+                                "Сессии сброшены администратором"))
                         .thenApply(ignored -> revoked))
                 .thenAccept(revoked -> source.sendMessage(revoked == 0
                         ? prefixed("<yellow>У " + account.username()
@@ -442,8 +443,9 @@ public final class AuthAdminCommand implements SimpleCommand {
                         ? CompletableFuture.<Void>completedFuture(null)
                         : core.security().resetRateLimit("login.per-account",
                                 account.lowerUsername()))
-                .thenCompose(ignored -> core.audit().logAdminAction(account.id(),
-                        actorId(source), locking
+                .thenCompose(ignored -> actorId(source))
+                .thenCompose(actor -> core.audit().logAdminAction(account.id(),
+                        actor, locking
                                 ? SecurityEventType.ACCOUNT_LOCKED
                                 : SecurityEventType.ACCOUNT_UNLOCKED,
                         contextOf(source),
@@ -464,8 +466,9 @@ public final class AuthAdminCommand implements SimpleCommand {
             return;
         }
         withAccount(source, args, (s, account) ->
-                core.authentication().adminResetPassword(account.id(), args[2],
-                                actorId(source), contextOf(source))
+                actorId(source)
+                        .thenCompose(actor -> core.authentication().adminResetPassword(
+                                account.id(), args[2], actor, contextOf(source)))
                         .thenAccept(result -> s.sendMessage(result.isSuccess()
                                 ? prefixed("<green>Пароль игрока " + account.username()
                                         + " изменён, сессии разорваны")
@@ -478,9 +481,10 @@ public final class AuthAdminCommand implements SimpleCommand {
                 source.sendMessage(prefixed("<yellow>У игрока нет привязанной почты."));
                 return;
             }
-            core.audit().logAdminAction(account.id(), actorId(source),
+            actorId(source)
+                    .thenCompose(actor -> core.audit().logAdminAction(account.id(), actor,
                             SecurityEventType.EMAIL_VERIFIED, contextOf(source),
-                            "Почта подтверждена администратором")
+                            "Почта подтверждена администратором"))
                     .thenRun(() -> source.sendMessage(
                             prefixed("<green>Почта игрока " + account.username() + " подтверждена")));
         });
@@ -647,10 +651,37 @@ public final class AuthAdminCommand implements SimpleCommand {
         });
     }
 
-    private long actorId(CommandSource source) {
-        // Консоль не имеет аккаунта: в аудите исполнитель останется пустым,
-        // но источник события будет SYSTEM, что и отличает её от игрока.
-        return 0L;
+    /**
+     * Идентификатор аккаунта исполнителя для записи аудита.
+     *
+     * <p>Раньше метод возвращал ноль всегда — и для консоли, и для игрока. Ноль
+     * не был безобидной заглушкой: он уезжал в {@code security_logs.actor_id},
+     * колонку с внешним ключом на {@code users.id}, и база отвергала вставку
+     * ({@code fk_security_logs_actor}). Записи аудита уходят пачкой, поэтому
+     * вместе с отвергнутой терялись и все соседние — события, к действиям
+     * администратора отношения не имевшие. Заодно ни одно действие над чужим
+     * аккаунтом не было ни к кому привязано, хотя ради этого колонка и заведена.
+     *
+     * <p>Теперь у игрока берётся его настоящий аккаунт, а консоль остаётся нулём —
+     * значением, которое {@link net.kofnetwork.auth.api.model.SecurityLogEntry#byAdmin}
+     * записывает как {@code NULL}: аккаунта у консоли действительно нет, и
+     * выдумывать его нельзя. Отличает её {@code source = SYSTEM}.
+     *
+     * <p>Отказ поиска не отменяет само действие: администратор уже заблокировал
+     * аккаунт, и терять запись об этом из-за недоступности базы незачем — она
+     * сохранится без исполнителя.
+     */
+    private CompletableFuture<Long> actorId(CommandSource source) {
+        if (!(source instanceof Player player)) {
+            return CompletableFuture.completedFuture(0L);
+        }
+        return core.authentication().findAccount(player.getUsername())
+                .thenApply(found -> found.map(Account::id).orElse(0L))
+                .exceptionally(e -> {
+                    logger.warn("Не удалось определить аккаунт администратора {}",
+                            player.getUsername(), e);
+                    return 0L;
+                });
     }
 
     private AuthContext contextOf(CommandSource source) {

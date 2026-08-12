@@ -166,4 +166,20 @@ public interface LinkService {
 
     /** Включает или выключает подтверждение входа через Discord. */
     @NotNull CompletableFuture<OperationResult<Void>> setDiscordLoginApproval(long accountId, boolean enabled);
+
+    /**
+     * Включает или выключает уведомления безопасности в Telegram.
+     *
+     * <p>Отдельная настройка от подтверждения входа, и объединять их нельзя.
+     * Подтверждение решает, пускать ли; уведомление лишь сообщает о том, что уже
+     * случилось. Владелец вправе оставить второй фактор и при этом не получать
+     * сообщение о каждом своём входе — и наоборот, следить за входами, не включая
+     * подтверждение.
+     */
+    @NotNull CompletableFuture<OperationResult<Void>> setTelegramNotifications(long accountId,
+                                                                               boolean enabled);
+
+    /** Включает или выключает уведомления безопасности в Discord. */
+    @NotNull CompletableFuture<OperationResult<Void>> setDiscordNotifications(long accountId,
+                                                                              boolean enabled);
 }

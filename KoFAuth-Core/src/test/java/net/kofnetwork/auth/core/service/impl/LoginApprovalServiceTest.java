@@ -157,12 +157,12 @@ class LoginApprovalServiceTest {
 
         @Override
         public @NotNull CompletableFuture<Integer> supersedePending(long accountId,
-                                                                     @NotNull String exceptPublicId,
+                                                                     long keepId,
                                                                      @NotNull Instant at) {
             int[] count = {0};
             rows.replaceAll((key, existing) -> {
                 if (existing.accountId() == accountId
-                        && !key.equals(exceptPublicId)
+                        && existing.id() < keepId
                         && (existing.status() == ApprovalStatus.PENDING
                         || (existing.requestSource() == net.kofnetwork.auth.api.model.EventSource.WEB
                         && existing.status() == ApprovalStatus.APPROVED
@@ -430,6 +430,57 @@ class LoginApprovalServiceTest {
             assertThat(decision.result())
                     .isEqualTo(LoginApprovalService.DecisionResult.EXPIRED);
             assertThat(completions).hasValue(0);
+        }
+
+        /**
+         * Регрессия: две одновременные попытки гасили друг друга.
+         *
+         * <p>Условие «погасить всё, кроме своей» симметрично, и при параллельном
+         * выпуске — вход в игру и вход на сайте одним человеком — каждая попытка
+         * успевала объявить другую устаревшей. Владелец получал две кнопки, обе
+         * мёртвые, и войти не мог ни одним способом, пока не начнёт заново.
+         *
+         * <p>Требуемое свойство: сколько бы попыток ни выпустили одновременно,
+         * ровно одна остаётся действующей.
+         */
+        @Test
+        @DisplayName("одновременные попытки не гасят друг друга")
+        void одновременныеПопыткиНеГасятДругДруга() throws Exception {
+            int parallel = 8;
+            var start = new java.util.concurrent.CountDownLatch(1);
+            var issued = java.util.Collections.synchronizedList(
+                    new java.util.ArrayList<LoginApproval>());
+            var pool = java.util.concurrent.Executors.newFixedThreadPool(parallel);
+            try {
+                List<java.util.concurrent.Future<?>> tasks = new java.util.ArrayList<>();
+                for (int i = 0; i < parallel; i++) {
+                    String attemptId = "попытка-" + i;
+                    tasks.add(pool.submit(() -> {
+                        start.await();
+                        issued.add(request(BotPlatform.TELEGRAM, attemptId));
+                        return null;
+                    }));
+                }
+                start.countDown();
+                for (var task : tasks) {
+                    task.get(10, java.util.concurrent.TimeUnit.SECONDS);
+                }
+            } finally {
+                pool.shutdownNow();
+            }
+
+            List<LoginApproval> alive = issued.stream()
+                    .map(approval -> approvals.findByPublicId(approval.publicId()).join())
+                    .flatMap(Optional::stream)
+                    .filter(approval -> approval.status() == ApprovalStatus.PENDING)
+                    .toList();
+
+            assertThat(alive)
+                    .as("хотя бы одна кнопка обязана остаться рабочей")
+                    .hasSize(1);
+            assertThat(service.decide(alive.get(0).publicId(), BotPlatform.TELEGRAM,
+                            TELEGRAM_USER, true).join().result())
+                    .isEqualTo(LoginApprovalService.DecisionResult.APPLIED);
         }
     }
 

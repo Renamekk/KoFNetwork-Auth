@@ -10,6 +10,7 @@ Slash-команды плюс меню на кнопках. Ответы эфе�
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import discord
@@ -17,14 +18,27 @@ from discord import app_commands
 from kofauth_common import (
     ApiUnavailable,
     BotMessage,
+    Card,
+    CardService,
     KoFAuthApi,
     OutboxListener,
     Settings,
+    cards,
     texts,
 )
 from kofauth_common import events as event_kinds
 
-from .views import PLATFORM, ApprovalView, Brand, MenuView, embed, home_embed
+from .views import (
+    PLATFORM,
+    PLATFORM_NAME,
+    ApprovalView,
+    Brand,
+    MenuView,
+    card_screen,
+    embed,
+    help_message,
+    home_screen,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -38,13 +52,21 @@ class DiscordBot(discord.Client):
         super().__init__(intents=discord.Intents.none())
         self._settings = settings
         self._api = api
+        self._cards = CardService(settings.cards)
         self._brand = Brand(
             panel_url=settings.panel_url,
             banner_url=settings.brand.banner_url,
             donate_url=settings.brand.donate_url,
+            emoji=settings.brand.emoji(),
+            cards=self._cards,
         )
         self.tree = app_commands.CommandTree(self)
         self._register()
+
+    async def close(self) -> None:
+        """Гасит поток отрисовки вместе с клиентом."""
+        self._cards.close()
+        await super().close()
 
     async def setup_hook(self) -> None:
         """Регистрирует команды.
@@ -77,8 +99,10 @@ class DiscordBot(discord.Client):
         async def menu_command(interaction: discord.Interaction) -> None:
             result = await _safe(interaction, api.account(PLATFORM, interaction.user.id))
             linked = result is not None and result.ok
+            body, files = home_screen(
+                result.data.get("username") if linked else None, brand)
             await interaction.response.send_message(
-                embed=home_embed(result.data.get("username") if linked else None, brand),
+                embed=body, files=files,
                 view=MenuView(api, interaction.user.id, linked, brand),
                 ephemeral=True,
             )
@@ -96,7 +120,7 @@ class DiscordBot(discord.Client):
                 )
                 return
             await interaction.response.send_message(
-                embed=embed(f"{texts.ICON['approve']} Аккаунт привязан",
+                embed=embed(f"{texts.ICON['ok']} Аккаунт привязан",
                             [f"Ник: **{result.data.get('username', '')}**",
                              "",
                              "Теперь подтверждение входа приходит сюда кнопками."]),
@@ -106,28 +130,34 @@ class DiscordBot(discord.Client):
 
         @tree.command(name="profile", description="Сведения об аккаунте")
         async def profile_command(interaction: discord.Interaction) -> None:
-            await _screen(interaction, api, f"{texts.ICON['profile']} Профиль",
-                          api.account(PLATFORM, interaction.user.id),
-                          lambda data: texts.profile_lines(
-                              data, donate_url=brand.donate_url))
+            await _screen(interaction, brand, api.account(PLATFORM, interaction.user.id),
+                          lambda data: cards.profile_card(
+                              data, donate_url=brand.donate_url,
+                              platform=PLATFORM_NAME))
 
         @tree.command(name="security", description="Защита аккаунта")
         async def security_command(interaction: discord.Interaction) -> None:
-            await _screen(interaction, api, f"{texts.ICON['security']} Защита аккаунта",
-                          api.account(PLATFORM, interaction.user.id),
-                          lambda data: texts.security_lines(data))
+            await _screen(interaction, brand, api.account(PLATFORM, interaction.user.id),
+                          cards.security_card)
 
         @tree.command(name="history", description="История входов")
         async def history_command(interaction: discord.Interaction) -> None:
-            await _screen(interaction, api, f"{texts.ICON['history']} Последние входы",
-                          api.history(PLATFORM, interaction.user.id),
-                          lambda data: texts.history_lines(data.get("history", [])))
+            await _screen(interaction, brand,
+                          api.history(PLATFORM, interaction.user.id,
+                                      limit=texts.HISTORY_LIMIT),
+                          lambda data: cards.history_card(data.get("history", [])))
 
         @tree.command(name="sessions", description="Активные сессии")
         async def sessions_command(interaction: discord.Interaction) -> None:
-            await _screen(interaction, api, f"{texts.ICON['sessions']} Активные сессии",
-                          api.sessions(PLATFORM, interaction.user.id),
-                          lambda data: texts.session_lines(data.get("sessions", [])))
+            await _screen(interaction, brand, api.sessions(PLATFORM, interaction.user.id),
+                          lambda data: cards.sessions_card(data.get("sessions", [])))
+
+        @tree.command(name="help",
+                      description="Как привязать аккаунт и какие есть команды")
+        async def help_command(interaction: discord.Interaction) -> None:
+            body, files = await help_message(brand)
+            await interaction.response.send_message(embed=body, files=files,
+                                                    ephemeral=True)
 
         @tree.command(name="unlink", description="Отвязать Discord")
         async def unlink_command(interaction: discord.Interaction) -> None:
@@ -167,7 +197,8 @@ class DiscordBot(discord.Client):
             await user.send(
                 embed=embed(f"{texts.ICON['lock']} " + lines[0], lines[1:],
                             colour=texts.ATTENTION_COLOUR),
-                view=ApprovalView(self._api, message.get("approvalId"), recipient),
+                view=ApprovalView(self._api, message.get("approvalId"), recipient,
+                                  emoji=self._brand.emoji),
             )
         except discord.HTTPException as exc:
             # Личные сообщения могут быть закрыты — это выбор человека, а не сбой
@@ -244,8 +275,14 @@ async def _safe(interaction: discord.Interaction, awaitable: Any) -> Any:
         return None
 
 
-async def _screen(interaction: discord.Interaction, api: KoFAuthApi, title: str,
-                  awaitable: Any, render: Any) -> None:
+async def _screen(interaction: discord.Interaction, brand: Brand, awaitable: Any,
+                  build: Callable[[dict[str, Any]], Card]) -> None:
+    """Отвечает на команду экраном-карточкой.
+
+    Ответ эфемерный: профиль, история и сессии — личные данные, и картинка
+    ничего в этом не меняет. Скорее наоборот: картинку проще переслать, чем
+    текст, и тем важнее, чтобы её видел только тот, кто её открыл.
+    """
     result = await _safe(interaction, awaitable)
     if result is None:
         return
@@ -254,9 +291,8 @@ async def _screen(interaction: discord.Interaction, api: KoFAuthApi, title: str,
             texts.NOT_LINKED.format(command="/discord"), ephemeral=True
         )
         return
-    await interaction.response.send_message(
-        embed=embed(title, render(result.data)), ephemeral=True
-    )
+    body, files = await card_screen(brand, build(result.data))
+    await interaction.response.send_message(embed=body, files=files, ephemeral=True)
 
 
 def register_message_handlers(bot: DiscordBot, listener: OutboxListener) -> None:
@@ -306,12 +342,15 @@ def register_message_handlers(bot: DiscordBot, listener: OutboxListener) -> None
     listener.on(event_kinds.LINK_CODE, on_link_code)
 
 
+#: Значки берутся из общего набора, а не пишутся здесь символами: иначе
+#: уведомление и экран, о котором оно говорит, помечены разными картинками.
 NOTICES = {
-    "AccountLoginEvent": ("🔓 Вход в аккаунт", "Ник: {username}\nАдрес: {ip}\n{at}"),
-    "PasswordChangedEvent": ("🔑 Пароль изменён",
+    "AccountLoginEvent": (f"{texts.ICON['approve']} Вход в аккаунт",
+                          "Ник: {username}\nАдрес: {ip}\n{at}"),
+    "PasswordChangedEvent": (f"{texts.ICON['lock']} Пароль изменён",
                              "{at}\n\nЕсли это были не вы — обратитесь к администрации."),
-    "SuspiciousActivityEvent": ("⚠️ Подозрительная активность",
+    "SuspiciousActivityEvent": (f"{texts.ICON['warning']} Подозрительная активность",
                                 "Ник: {username}\nАдрес: {ip}\n{at}"),
-    "SessionInvalidatedEvent": ("🚪 Сессии завершены", "{at}"),
-    "BindingChangedEvent": ("🔗 Привязки изменены", "{at}"),
+    "SessionInvalidatedEvent": (f"{texts.ICON['logout']} Сессии завершены", "{at}"),
+    "BindingChangedEvent": (f"{texts.ICON['link']} Привязки изменены", "{at}"),
 }

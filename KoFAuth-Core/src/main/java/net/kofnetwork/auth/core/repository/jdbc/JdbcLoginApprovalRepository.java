@@ -211,18 +211,23 @@ public final class JdbcLoginApprovalRepository implements LoginApprovalRepositor
 
     @Override
     public @NotNull CompletableFuture<Integer> supersedePending(long accountId,
-                                                                 @NotNull String exceptPublicId,
+                                                                 long keepId,
                                                                  @NotNull Instant at) {
         // Прежние кнопки того же аккаунта гасятся как истёкшие: новая попытка входа
         // отменяет предыдущую, и нажатие старой кнопки не должно ничего открывать.
+        //
+        // Граница — номер записи. «Всё, кроме моей» давало симметричное условие, и
+        // две одновременные попытки одного аккаунта гасили друг друга: выживать было
+        // некому. `id < keepId` упорядочивает их одинаково для обоих запросов, и
+        // действующей остаётся последняя записанная.
         return sql.update("""
                         UPDATE login_approvals SET status = 'EXPIRED', decided_at = ?
-                         WHERE account_id = ? AND public_id <> ?
+                         WHERE account_id = ? AND id < ?
                            AND (status = 'PENDING'
                                 OR (request_source = 'WEB' AND status = 'APPROVED'
                                     AND exchange_consumed_at IS NULL))
                         """,
-                SqlTypes.toTimestamp(at), accountId, exceptPublicId);
+                SqlTypes.toTimestamp(at), accountId, keepId);
     }
 
     @Override

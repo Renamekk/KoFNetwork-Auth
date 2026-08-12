@@ -19,6 +19,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from .cards.settings import CardSettings
+from .glyphs import EmojiSet
+
 
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
@@ -152,12 +155,28 @@ class BrandSettings:
         наружу незачем. Telegram загружает его один раз и дальше пользуется
         выданным ``file_id``; Discord умеет только ссылку
     :param donate_url: страница поддержки сервера, показывается в профиле
+    :param emoji_discord: фирменные emoji на кнопках Discord, ``ключ=<:имя:id>``
+        через запятую. Идентификатор выдаёт сама платформа — выдумать его
+        нельзя, поэтому по умолчанию тут пусто
+    :param emoji_telegram: фирменные emoji в тексте Telegram, ``ключ=id``
+        документа custom emoji
     """
 
     banner_url: str = ""
     banner_file: str = ""
     donate_url: str = ""
     site_url: str = ""
+    emoji_discord: str = ""
+    emoji_telegram: str = ""
+
+    def emoji(self) -> EmojiSet:
+        """Разобранный набор значков.
+
+        Разбор ленивый и по требованию: боту он нужен один раз при сборке, а
+        держать в настройках готовый объект значило бы разбирать окружение
+        раньше, чем кто-нибудь сообщит об ошибке в нём.
+        """
+        return EmojiSet(self.emoji_discord, self.emoji_telegram)
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +187,7 @@ class Settings:
     telegram: TelegramSettings
     discord: DiscordSettings
     brand: BrandSettings
+    cards: CardSettings
     panel_url: str
     log_level: str
 
@@ -205,6 +225,17 @@ class Settings:
                 banner_file=_env("KOFAUTH_BANNER_FILE"),
                 donate_url=_env("KOFAUTH_DONATE_URL"),
                 site_url=_env("KOFAUTH_SITE_URL"),
+                emoji_discord=_env("KOFAUTH_EMOJI_DISCORD"),
+                emoji_telegram=_env("KOFAUTH_EMOJI_TELEGRAM"),
+            ),
+            cards=CardSettings(
+                enabled=_env_bool("KOFAUTH_CARDS_ENABLED", True),
+                directory=_env("KOFAUTH_CARDS_DIR"),
+                quality=_env_int("KOFAUTH_CARDS_QUALITY", 84),
+                workers=_env_int("KOFAUTH_CARDS_WORKERS", 2),
+                cache_entries=_env_int("KOFAUTH_CARDS_CACHE_ENTRIES", 48),
+                cache_bytes=_env_int("KOFAUTH_CARDS_CACHE_MB", 24) * 1024 * 1024,
+                cache_ttl=float(_env_int("KOFAUTH_CARDS_CACHE_TTL_SECONDS", 600)),
             ),
             panel_url=_env("KOFAUTH_PANEL_URL", "http://127.0.0.1:8080"),
             log_level=_env("KOFAUTH_LOG_LEVEL", "INFO").upper(),
