@@ -86,14 +86,14 @@ MySQL, Redis, REST API с личным кабинетом. Через 10–20 м
 ./mvnw clean install
 ```
 
-413 модульных тестов плюс интеграционные. Последние поднимают настоящие
+419 модульных тестов плюс интеграционные. Последние поднимают настоящие
 MySQL 8 и Redis 7 через Testcontainers, поэтому нужен запущенный Docker.
-Без него — `./mvnw clean install -DskipITs`, это те самые 413.
+Без него — `./mvnw clean install -DskipITs`, это те самые 419.
 
 | Модуль | Модульных тестов |
 |---|---|
-| `KoFAuth-API` | 119 |
-| `KoFAuth-Core` | 171 |
+| `KoFAuth-API` | 124 |
+| `KoFAuth-Core` | 172 |
 | `KoFAuth-Velocity` | 71 |
 | `KoFAuth-WebAPI` | 39 |
 | `KoFAuth-Paper` | 13 |
@@ -109,7 +109,7 @@ MySQL 8 и Redis 7 через Testcontainers, поэтому нужен запу
 cd bots && python -m pytest tests -q
 ```
 
-47 тестов. Работа с самими API Telegram и Discord не тестируется: она сводится
+226 тестов. Работа с самими API Telegram и Discord не тестируется: она сводится
 к вызовам библиотек, а мокать их означало бы проверять моки.
 
 ## Документация

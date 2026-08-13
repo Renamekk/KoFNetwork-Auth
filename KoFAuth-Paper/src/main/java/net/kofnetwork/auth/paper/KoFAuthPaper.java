@@ -14,6 +14,7 @@ import net.kofnetwork.auth.paper.listener.LockdownListener;
 import net.kofnetwork.auth.paper.world.LimboWorldFactory;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.minimessage.MiniMessage;
+import net.kyori.adventure.text.minimessage.tag.resolver.Placeholder;
 import net.kyori.adventure.title.Title;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
@@ -24,12 +25,16 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.plugin.IllegalPluginAccessException;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.NotNull;
 
 import java.time.Duration;
 import java.util.Locale;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Плагин Paper. Работает в одном из двух режимов, задаваемых {@code paper.yml}.
@@ -279,13 +284,10 @@ public final class KoFAuthPaper extends JavaPlugin implements Listener {
     /**
      * Держит на экране название сети, пока игрок не прошёл вход.
      *
-     * <p><b>Почему это повторяющаяся задача, а не одна отправка.</b> Титул в
-     * Minecraft живёт заданное число тиков и гаснет сам; протокол не умеет
-     * «показывать, пока не сниму». Поэтому он переотправляется с периодом,
-     * заведомо меньшим времени показа, — тогда следующая отправка приходит до
-     * того, как погасла предыдущая, и надпись выглядит неподвижной. Плавное
-     * появление задаётся только первой отправке: повтор с ненулевым fade-in
-     * заставлял бы надпись пульсировать.
+     * <p><b>Почему здесь две повторяющиеся задачи.</b> Состояние входа читается
+     * редко и сохраняется локально. Отдельная лёгкая задача меняет фазу
+     * градиента уже подготовленного титула. Так плавная анимация не превращается
+     * в несколько запросов к Redis на игрока каждую секунду.
      *
      * <p>Подзаголовок зависит от шага входа: пока не пройдена CAPTCHA — про неё,
      * дальше — про пароль или регистрацию. Игрок всегда видит, чего от него
@@ -302,26 +304,96 @@ public final class KoFAuthPaper extends JavaPlugin implements Listener {
         getServer().getScheduler().runTaskTimer(this, () -> {
             for (Player player : getServer().getOnlinePlayers()) {
                 UUID uuid = player.getUniqueId();
-                core.sessions().getState(uuid).thenAccept(state -> {
-                    if (state.isAuthenticated()) {
-                        titled.remove(uuid);
-                        return;
-                    }
-                    showLimboTitle(player, state);
-                });
+                long generation = limboTitleRequestSequence.incrementAndGet();
+                limboTitleGenerations.put(uuid, generation);
+                core.sessions().getState(uuid).whenComplete((state, failure) ->
+                        applyLimboTitleStateOnMainThread(uuid, generation, state, failure));
             }
-        }, 20L, ticks);
+        }, 1L, ticks);
+
+        Duration animationInterval = core.config().getDuration(ConfigFile.PAPER,
+                "limbo.title.animation.interval", Duration.ofMillis(150));
+        long animationTicks = Math.max(2L, animationInterval.toMillis() / 50L);
+        getServer().getScheduler().runTaskTimer(this, () -> {
+            if (!limboTitleAnimated()) {
+                return;
+            }
+            double angle = titleAnimationFrame.getAndIncrement() * (Math.PI * 2.0 / 24.0);
+            Component header = limboTitle(angle);
+            for (Player player : getServer().getOnlinePlayers()) {
+                AuthState state = limboTitleStates.get(player.getUniqueId());
+                if (state != null && !state.isAuthenticated()) {
+                    showLimboTitle(player, state, header);
+                }
+            }
+        }, 1L, animationTicks);
     }
 
     /** Кому титул уже показывался: определяет, нужно ли плавное появление. */
-    private final java.util.Set<UUID> titled = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final java.util.Set<UUID> titled = ConcurrentHashMap.newKeySet();
+    /** Последнее известное состояние входа: кадры анимации не ходят в Redis. */
+    private final ConcurrentMap<UUID, AuthState> limboTitleStates = new ConcurrentHashMap<>();
+    /** Номер последнего запроса не даёт старому async-ответу перезаписать новый. */
+    private final ConcurrentMap<UUID, Long> limboTitleGenerations = new ConcurrentHashMap<>();
+    private final AtomicLong limboTitleRequestSequence = new AtomicLong();
+    private final AtomicLong titleAnimationFrame = new AtomicLong();
 
-    private void showLimboTitle(Player player, AuthState state) {
+    private static final String DEFAULT_LIMBO_TITLE = "<kof><network>";
+    /** Поддержка конфигурации, созданной первой версией анимации. */
+    private static final String LEGACY_PHASE_LIMBO_TITLE =
+            "<gradient:#F40D01:#FFD700:<phase>><bold>KoF</bold></gradient>"
+                    + "<gradient:#FFD700:#FFFFFF:<phase>><bold>Network</bold></gradient>";
+
+    private void applyLimboTitleStateOnMainThread(UUID uuid, long generation,
+                                                   AuthState state, Throwable failure) {
+        if (!isEnabled()) {
+            return;
+        }
+        try {
+            getServer().getScheduler().runTask(this,
+                    () -> applyLimboTitleState(uuid, generation, state, failure));
+        } catch (IllegalPluginAccessException ignored) {
+            // The future completed while Paper was disabling this plugin.
+        }
+    }
+
+    private void applyLimboTitleState(UUID uuid, long generation,
+                                      AuthState state, Throwable failure) {
+        Long latest = limboTitleGenerations.get(uuid);
+        if (latest == null || latest.longValue() != generation) {
+            return;
+        }
+
+        Player player = getServer().getPlayer(uuid);
+        if (player == null || !player.isOnline()) {
+            limboTitleGenerations.remove(uuid, generation);
+            limboTitleStates.remove(uuid);
+            titled.remove(uuid);
+            return;
+        }
+        if (failure != null || state == null) {
+            return;
+        }
+        if (state.isAuthenticated()) {
+            limboTitleGenerations.remove(uuid, generation);
+            boolean hadVisibleTitle = titled.remove(uuid);
+            hadVisibleTitle |= limboTitleStates.remove(uuid) != null;
+            if (hadVisibleTitle) {
+                player.clearTitle();
+            }
+            return;
+        }
+
+        limboTitleStates.put(uuid, state);
+        if (!limboTitleAnimated()) {
+            showLimboTitle(player, state, limboTitle(0.0));
+        }
+    }
+
+    private void showLimboTitle(Player player, AuthState state, Component header) {
         UUID uuid = player.getUniqueId();
         boolean first = titled.add(uuid);
 
-        Component header = parse("limbo-title",
-                "<gradient:#4facfe:#00f2fe><bold>KoF Network</bold></gradient>");
         Component subtitle = parse("limbo-subtitle-" + subtitleKey(player, state),
                 defaultSubtitle(state));
 
@@ -330,9 +402,33 @@ public final class KoFAuthPaper extends JavaPlugin implements Listener {
                 duration("limbo.title.stay", Duration.ofSeconds(5)),
                 duration("limbo.title.fade-out", Duration.ofMillis(250)));
 
-        // Adventure в Paper потокобезопасен, отправка из асинхронного колбэка
-        // не требует возврата в главный поток.
+        // Все обращения к Player выполняются только в основном потоке Paper;
+        // async-ответ состояния возвращается сюда через scheduler.
         player.showTitle(Title.title(header, subtitle, times));
+    }
+
+    private boolean limboTitleAnimated() {
+        if (!core.config().getBoolean(ConfigFile.PAPER,
+                "limbo.title.animation.enabled", true)) {
+            return false;
+        }
+        String template = rawMessage("limbo-title", DEFAULT_LIMBO_TITLE);
+        return template.contains("<kof>") || template.contains("<network>")
+                || template.equals(LEGACY_PHASE_LIMBO_TITLE);
+    }
+
+    private Component limboTitle(double angle) {
+        String template = rawMessage("limbo-title", DEFAULT_LIMBO_TITLE);
+        if (template.equals(LEGACY_PHASE_LIMBO_TITLE)) {
+            template = DEFAULT_LIMBO_TITLE;
+        } else if (template.contains("<phase>")) {
+            // A custom legacy gradient remains valid but static; only the two
+            // component placeholders can guarantee fixed endpoint colours.
+            template = template.replace("<phase>", "0");
+        }
+        return miniMessage.deserialize(template,
+                Placeholder.component("kof", BrandGradient.kof(angle)),
+                Placeholder.component("network", BrandGradient.network(angle)));
     }
 
     /**
@@ -403,8 +499,11 @@ public final class KoFAuthPaper extends JavaPlugin implements Listener {
 
     /** Текст из {@code messages.yml}. */
     private Component parse(String path, String fallback) {
-        return miniMessage.deserialize(
-                core.config().getString(ConfigFile.MESSAGES, path, fallback));
+        return miniMessage.deserialize(rawMessage(path, fallback));
+    }
+
+    private String rawMessage(String path, String fallback) {
+        return core.config().getString(ConfigFile.MESSAGES, path, fallback);
     }
 
     // ------------------------------------------------------------------ события
@@ -566,6 +665,9 @@ public final class KoFAuthPaper extends JavaPlugin implements Listener {
         // Иначе множество растёт на каждого зашедшего и никогда не уменьшается,
         // а вернувшийся игрок не увидит плавного появления надписи.
         titled.remove(uuid);
+        limboTitleStates.remove(uuid);
+        limboTitleGenerations.remove(uuid);
+        event.getPlayer().clearTitle();
 
         // Вышедший игрок оператором сети не считается: иначе отметка жила бы
         // до истечения срока и наделяла правами того, кого на серверах нет.

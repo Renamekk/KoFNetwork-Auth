@@ -97,7 +97,8 @@ public final class MessageService {
             return Optional.empty();
         }
         Component header = plain("welcome-title",
-                "<gradient:#FF2D2D:#FFD700:#FFFFFF><bold>KoFNetwork</bold></gradient>");
+                "<gradient:#F40D01:#FFD700><bold>KoF</bold></gradient>"
+                        + "<gradient:#FFD700:#FFFFFF><bold>Network</bold></gradient>");
         Component subtitle = miniMessage.deserialize(substitute(
                 raw("welcome-subtitle", "<gray>С возвращением, <white><player></white>!"),
                 // Ник приходит от Velocity и ограничен набором символов Minecraft,
